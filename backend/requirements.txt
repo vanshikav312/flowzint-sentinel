@@ -1,0 +1,20 @@
+# Core LangChain (no openai dependency)
+langchain
+langchain-community
+langchain-huggingface
+
+# Local embeddings — no API key required
+sentence-transformers
+
+# Vector store
+chromadb
+
+# Sparse retrieval (BM25 hybrid RAG)
+rank-bm25
+
+# API server
+fastapi
+uvicorn[standard]
+
+# Environment config
+python-dotenv

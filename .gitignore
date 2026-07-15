@@ -1,0 +1,33 @@
+# Python
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Vector DB — regenerated locally via ingest script, never committed
+backend/database/
+
+# Raw cloned docs — regenerated via git clone in ingest step, never committed
+backend/data/_raw_docs/
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+.npm/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
