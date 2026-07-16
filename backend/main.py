@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Initialise SQLite tables (no-op if they already exist)
+from database.db import init_db
+init_db()
+
 app = FastAPI(
     title="FlowZint Sentinel",
     description="Self-healing AI support bot with hybrid RAG and confidence routing.",

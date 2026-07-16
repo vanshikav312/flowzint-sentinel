@@ -10,8 +10,12 @@ __pycache__/
 dist/
 build/
 
-# Vector DB — regenerated locally via ingest script, never committed
-backend/database/
+# Vector DB and SQLite data — regenerated locally, never committed
+backend/database/razorpay_db/
+backend/database/bm25_index.pkl
+backend/database/bm25_meta.json
+backend/database/sentinel.db
+# db.py is tracked — only the generated data files are ignored
 
 # Raw cloned docs — regenerated via git clone in ingest step, never committed
 backend/data/_raw_docs/
