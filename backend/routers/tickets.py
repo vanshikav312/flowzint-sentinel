@@ -46,8 +46,8 @@ class ResolveBody(BaseModel):
 
 # ── Row → Ticket ──────────────────────────────────────────────────────────────
 
-def _row_to_ticket(row) -> Ticket:
-    embedding_raw = row["query_embedding"]
+def _row_to_ticket(row, include_embedding: bool = True) -> Ticket:
+    embedding_raw = row["query_embedding"] if include_embedding else None
     return Ticket(
         ticket_id       = row["ticket_id"],
         query           = row["query"],
@@ -106,14 +106,18 @@ def create_ticket_internal(
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
 
-@router.get("/", response_model=list[Ticket])
+@router.get("/", response_model=list[Ticket], response_model_exclude={"query_embedding"})
 async def list_tickets():
-    """Return all tickets (open + resolved), newest first."""
+    """
+    Return all tickets (open + resolved), newest first.
+    Embeddings (384 floats each) are excluded — the dashboard never shows them;
+    Stage 3 clustering reads them straight from the DB instead.
+    """
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM tickets ORDER BY created_at DESC"
         ).fetchall()
-    return [_row_to_ticket(r) for r in rows]
+    return [_row_to_ticket(r, include_embedding=False) for r in rows]
 
 
 @router.get("/{ticket_id}", response_model=Ticket)

@@ -113,6 +113,19 @@ def _get_groq_client():
     return Groq(api_key=api_key)
 
 
+def warmup() -> None:
+    """
+    Pre-load all heavy singletons at server startup so the first chat request
+    doesn't pay ~10s of lazy loading. Missing index/key is logged, not fatal —
+    the server must still boot before ingestion has been run.
+    """
+    for loader in (_get_embeddings, _get_vectorstore, _get_bm25, _get_groq_client):
+        try:
+            loader()
+        except Exception as e:
+            log.warning(f"Warmup: {loader.__name__} skipped — {e}")
+
+
 # ── Retrieval helpers ─────────────────────────────────────────────────────────
 
 def _dense_retrieve(query: str) -> list[tuple[str, dict, float]]:
@@ -268,10 +281,14 @@ class ChatResponse(BaseModel):
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/", response_model=ChatResponse)
-async def chat(body: ChatRequest):
+def chat(body: ChatRequest):
     """
     Stage 1: Hybrid RAG answer pipeline.
     Dense (ChromaDB) + Sparse (BM25) → RRF fusion → Groq LLM → response.
+
+    Deliberately sync (no `async`): the embedding model and the Groq HTTP call
+    are blocking, so FastAPI must run this in its threadpool to avoid stalling
+    the event loop for concurrent users.
     """
     query = body.query.strip()
     if not query:
@@ -335,9 +352,10 @@ async def chat(body: ChatRequest):
         log.warning(f"Groq API error: {e}")
         from routers.tickets import create_ticket_internal
         ticket = create_ticket_internal(
-            query=query,
-            confidence=0.0,
-            sources=[],
+            query           = query,
+            confidence      = 0.0,
+            sources         = [],
+            query_embedding = query_embedding,
         )
         raise HTTPException(
             status_code=503,
