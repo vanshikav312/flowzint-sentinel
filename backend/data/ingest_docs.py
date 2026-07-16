@@ -358,6 +358,8 @@ def build_chroma(chunks):
                 embedding=embeddings,
                 persist_directory=str(CHROMA_DIR),
                 collection_name="razorpay_kb",
+                # Cosine similarity so confidence thresholds are on a 0–1 scale
+                collection_metadata={"hnsw:space": "cosine"},
             )
         else:
             vectorstore.add_documents(batch)

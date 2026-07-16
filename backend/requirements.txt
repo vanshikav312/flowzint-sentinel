@@ -12,6 +12,9 @@ chromadb
 # Sparse retrieval (BM25 hybrid RAG)
 rank-bm25
 
+# LLM answer generation + KB article drafting (free tier)
+groq
+
 # API server
 fastapi
 uvicorn[standard]

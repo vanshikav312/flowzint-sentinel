@@ -63,7 +63,7 @@ flowzint-sentinel/
 | Sparse Retrieval | BM25 via `rank-bm25` |
 | LLM (answer gen) | Groq API (free tier) — see `.env.example` |
 | Backend | FastAPI + Uvicorn |
-| Frontend | Next.js 14 (App Router) + Tailwind CSS |
+| Frontend | Next.js 16 (App Router) + React 19 + Tailwind CSS v4 |
 
 > ✅ **All embeddings are 100% local. No OpenAI dependency anywhere in the pipeline.**
 
@@ -96,10 +96,14 @@ cp .env.example .env
 # Edit .env and fill in your GROQ_API_KEY (free tier at console.groq.com)
 ```
 
-### 4. Run the knowledge base ingestion script
+### 4. Download the raw docs & run the knowledge base ingestion script
 ```bash
-# (Populates backend/database/ with ChromaDB vectors — run once, or after new docs are added)
-python data/ingest.py
+# One-time: clone the Razorpay docs corpus that the KB is built from
+git clone https://github.com/razorpay/markdown-docs.git data/_raw_docs
+
+# Populates backend/database/ with ChromaDB vectors + BM25 index
+# (run once, or after new docs are added; add --dry-run to preview the file filter)
+python data/ingest_docs.py
 ```
 
 ### 5. Start the backend server
@@ -129,6 +133,6 @@ npm run dev
 
 ## 📌 Hackathon Notes
 
-- Vector DB is **always regenerated locally** via `data/ingest.py` — the `backend/database/` folder is gitignored.
+- Vector DB is **always regenerated locally** via `data/ingest_docs.py` — the `backend/database/` folder is gitignored.
 - The self-learning loop writes new KB articles back into ChromaDB automatically after human approval.
 - Incident detection is threshold-based clustering, no external service required.

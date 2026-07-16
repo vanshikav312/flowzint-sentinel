@@ -23,13 +23,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Routers (uncomment as you build each module) ──────────────────────────────
-# from routers import chat, tickets, incidents, kb
-# app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
-# app.include_router(tickets.router,   prefix="/api/tickets",   tags=["Tickets"])
-# app.include_router(incidents.router, prefix="/api/incidents", tags=["Incidents"])
-# app.include_router(kb.router,        prefix="/api/kb",        tags=["Knowledge Base"])
-# ─────────────────────────────────────────────────────────────────────────────
+from routers import chat, tickets, incidents, kb
+
+app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
+app.include_router(tickets.router,   prefix="/api/tickets",   tags=["Tickets"])
+app.include_router(incidents.router, prefix="/api/incidents", tags=["Incidents"])
+app.include_router(kb.router,        prefix="/api/kb",        tags=["Knowledge Base"])
 
 
 @app.get("/", tags=["Health"])
