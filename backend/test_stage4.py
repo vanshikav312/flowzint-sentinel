@@ -139,6 +139,12 @@ app.router.lifespan_context = _noop_lifespan  # type: ignore[assignment]
 
 from fastapi.testclient import TestClient
 
+# Stub the Stage 5 KB upsert — it needs the real embedding model / ChromaDB /
+# BM25 index, which this suite deliberately never loads. The live upsert path
+# is covered end-to-end by test_stage5 / manual demo flow instead.
+import routers.kb as _kb_module
+_kb_module._upsert_into_kb = lambda *a, **k: None
+
 client = TestClient(app, raise_server_exceptions=True)
 
 # ── Demo ticket queries (UPI-themed) ──────────────────────────────────────────

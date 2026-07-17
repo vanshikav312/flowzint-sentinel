@@ -14,7 +14,7 @@ build/
 backend/database/razorpay_db/
 backend/database/bm25_index.pkl
 backend/database/bm25_meta.json
-backend/database/sentinel.db
+backend/database/sentinel.db*
 # db.py is tracked — only the generated data files are ignored
 
 # Raw cloned docs — regenerated via git clone in ingest step, never committed

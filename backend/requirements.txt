@@ -19,12 +19,9 @@ groq
 fastapi
 uvicorn[standard]
 
-# Pin Starlette >= 1.2.0 explicitly.
-# httpx2 support in TestClient was added in 1.2.0 (PR #3291, May 28 2026).
-# Without this pin, pip may resolve an older Starlette where testclient.py
-# imports plain httpx instead, producing inconsistent test behavior across
-# teammate environments.
-starlette>=1.2.0
+# NOTE: do NOT pin starlette>=1.2.0 here — installed fastapi (0.116.x)
+# requires starlette<0.48, so that pin forces a major FastAPI upgrade or a
+# resolver failure. TestClient works on the current stack via plain httpx.
 
 # Environment config
 python-dotenv
@@ -33,7 +30,6 @@ python-dotenv
 eval_type_backport
 
 # HTTP client — required by FastAPI/Starlette TestClient.
-# httpx2 is the actively maintained successor to httpx (Pydantic Services,
-# February 2026). Starlette's testclient.py imports httpx2 first; httpx alone
-# will trigger a deprecation warning on current installs.
-httpx2
+# (On starlette >= 1.2 the testclient prefers httpx2; on our 0.47.x stack
+# plain httpx is the correct dependency. Both test suites pass with httpx.)
+httpx

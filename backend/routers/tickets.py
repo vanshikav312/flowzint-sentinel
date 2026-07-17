@@ -191,10 +191,13 @@ async def create_ticket(body: dict):
 
 
 @router.patch("/{ticket_id}/resolve", response_model=Ticket)
-async def resolve_ticket(ticket_id: str, body: ResolveBody):
+def resolve_ticket(ticket_id: str, body: ResolveBody):
     """
     Stage 4: Mark ticket as resolved.
     Auto-creates a KB draft for the self-learning loop (Stage 5).
+
+    Sync endpoint (threadpool): draft creation may call the LLM to polish
+    the article, which is a blocking HTTP call.
     """
     with get_db() as conn:
         row = conn.execute(
@@ -218,6 +221,8 @@ async def resolve_ticket(ticket_id: str, body: ResolveBody):
             title            = f"Resolution: {ticket.query[:60]}",
             content          = f"Q: {ticket.query}\n\nA: {resolution}",
             source_ticket_id = ticket_id,
+            query            = ticket.query,      # lets the LLM draft a clean
+            resolution       = resolution,        # article; raw Q&A is fallback
         )
 
         conn.execute(
@@ -232,4 +237,8 @@ async def resolve_ticket(ticket_id: str, body: ResolveBody):
             (resolution, draft.draft_id, resolved_at, ticket_id),
         )
 
-    return await get_ticket(ticket_id)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
+    return _row_to_ticket(row)
