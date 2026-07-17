@@ -13,6 +13,7 @@ Each ticket stores:
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
@@ -23,6 +24,8 @@ from pydantic import BaseModel
 from database.db import get_db
 
 router = APIRouter()
+
+log = logging.getLogger("tickets")
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -113,8 +116,7 @@ def create_ticket_internal(
         from routers.incidents import detect_incidents_internal
         detect_incidents_internal()
     except Exception as _inc_err:
-        import logging as _log
-        _log.getLogger("tickets").warning(
+        log.warning(
             f"Stage 3 incident detection skipped after ticket {ticket_id}: {_inc_err}"
         )
 

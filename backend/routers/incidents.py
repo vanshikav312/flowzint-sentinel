@@ -108,12 +108,20 @@ MIN_CLUSTER_SIZE = 2           # Minimum number of tickets in a cluster for it
                                # to be promoted to an Incident.  Set to 2 for
                                # the demo; 3-5 is more realistic for production.
 
-INCIDENT_WINDOW_MINUTES = int(os.getenv("INCIDENT_WINDOW_MINUTES", "30"))
+INCIDENT_WINDOW_MINUTES: int
+try:
+    INCIDENT_WINDOW_MINUTES = max(1, int(os.getenv("INCIDENT_WINDOW_MINUTES", "30")))
+except ValueError:
+    INCIDENT_WINDOW_MINUTES = 30
+    log.warning(
+        "INCIDENT_WINDOW_MINUTES env var is not a valid integer — defaulting to 30 minutes."
+    )
                                # Rolling time window: only tickets created within
                                # this many minutes are eligible for clustering.
                                # Override via INCIDENT_WINDOW_MINUTES env var.
                                # 30 min is the default for the hackathon demo;
                                # 60-240 min is more typical for production.
+                               # Values <= 0 are clamped to 1 minute.
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -279,23 +287,22 @@ def _centroid_cluster(embeddings: np.ndarray) -> list[list[int]]:
     return clusters
 
 
-def _find_existing_incident(ticket_ids_set: frozenset) -> Incident | None:
+def _find_existing_incident(
+    ticket_ids_set: frozenset,
+    open_incident_rows: list,
+) -> Incident | None:
     """
-    Query the database for an existing *open* incident whose ticket set overlaps
-    significantly with the newly detected cluster.
+    Search a pre-fetched list of open incident rows for one whose ticket set
+    overlaps significantly with the newly detected cluster.
 
     Overlap criterion: if >= 50% of the cluster's tickets are already tracked
     in an existing open incident, we treat them as the same incident (the
     cluster has simply grown since the last detection run).
 
-    This prevents duplicate incidents accumulating across repeated /detect calls.
+    Receives pre-fetched rows so the caller can avoid opening a new DB
+    connection on every cluster in the loop.
     """
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM incidents WHERE status = 'open'"
-        ).fetchall()
-
-    for row in rows:
+    for row in open_incident_rows:
         existing_set = frozenset(json.loads(row["ticket_ids"]))
         overlap = len(ticket_ids_set & existing_set)
         if overlap >= len(ticket_ids_set) * 0.5:
@@ -327,6 +334,10 @@ def detect_incidents_internal() -> list[Incident]:
         Returns an empty list if there are fewer open tickets than MIN_CLUSTER_SIZE
         or if embedding fails for any reason.
     """
+    # _row_to_ticket is imported lazily here (not at module level) to break the
+    # circular import chain: incidents.py is imported by tickets.py at runtime,
+    # and tickets.py is imported by incidents.py — a top-level import on either
+    # side would cause an ImportError at startup.
     from routers.tickets import _row_to_ticket
 
     # ── Step 1: Pull recent open tickets from SQLite ─────────────────────────
@@ -398,7 +409,7 @@ def detect_incidents_internal() -> list[Incident]:
     # Build ordered valid_tickets / embeddings arrays (exclude any ticket whose
     # embedding could not be obtained)
     embeddings_list.sort(key=lambda x: x[0])
-    valid_tickets: list = []
+    valid_tickets: list["Ticket"] = []
     valid_embeddings: list[np.ndarray] = []
     for idx, emb in embeddings_list:
         valid_tickets.append(open_tickets[idx])
@@ -416,6 +427,13 @@ def detect_incidents_internal() -> list[Incident]:
     # ── Step 3: Centroid-based clustering ────────────────────────────────────
     clusters = _centroid_cluster(embeddings)
 
+    # Fetch all open incidents once before the cluster loop to avoid opening
+    # a new DB connection on every cluster (Bug B2 fix).
+    with get_db() as conn:
+        open_incident_rows = conn.execute(
+            "SELECT * FROM incidents WHERE status = 'open'"
+        ).fetchall()
+
     now = datetime.now(timezone.utc).isoformat()
     affected: list[Incident] = []
 
@@ -428,7 +446,7 @@ def detect_incidents_internal() -> list[Incident]:
         ticket_ids      = sorted(t.ticket_id for t in cluster_tickets)
         ticket_ids_set  = frozenset(ticket_ids)
 
-        existing = _find_existing_incident(ticket_ids_set)
+        existing = _find_existing_incident(ticket_ids_set, open_incident_rows)
 
         if existing:
             # ── Update existing incident in SQLite ────────────────────────────
@@ -455,13 +473,19 @@ def detect_incidents_internal() -> list[Incident]:
                     ),
                 )
 
-            # Return the refreshed row to the caller
-            with get_db() as conn:
-                row = conn.execute(
-                    "SELECT * FROM incidents WHERE incident_id = ?",
-                    (existing.incident_id,),
-                ).fetchone()
-            updated = _row_to_incident(row)
+            # Build the updated Incident from known data — avoids a redundant
+            # SELECT round-trip after the UPDATE (B2 fix).
+            updated = Incident(
+                incident_id          = existing.incident_id,
+                topic                = existing.topic,
+                ticket_ids           = merged_ids,
+                ticket_count         = new_count,
+                severity             = new_severity,
+                status               = existing.status,
+                detected_at          = existing.detected_at,
+                updated_at           = now,
+                similarity_threshold = existing.similarity_threshold,
+            )
 
             log.info(
                 f"Incident {updated.incident_id} updated — "
@@ -550,9 +574,17 @@ async def run_detection():
     Returns a summary of how many tickets were scanned and how many
     incidents were created or updated.
     """
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(minutes=INCIDENT_WINDOW_MINUTES)
+    ).isoformat()
     with get_db() as conn:
         open_count = conn.execute(
-            "SELECT COUNT(*) as count FROM tickets WHERE status = 'open'"
+            """
+            SELECT COUNT(*) as count FROM tickets
+             WHERE status = 'open'
+               AND created_at >= ?
+            """,
+            (window_start,),
         ).fetchone()["count"]
 
     affected = detect_incidents_internal()
