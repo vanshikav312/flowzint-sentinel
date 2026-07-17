@@ -256,11 +256,15 @@ def detect_incidents_internal() -> list[Incident]:
         or if embedding fails for any reason.
     """
     # ── Step 1: Pull open tickets ─────────────────────────────────────────────
-    from routers.tickets import _TICKETS   # lazy import to avoid circular deps
+    from database.db import get_db
+    from routers.tickets import _row_to_ticket
+    import json
 
-    # Only consider open tickets.  Resolved tickets represent closed issues and
-    # should not continue to influence incident detection.
-    open_tickets = [t for t in _TICKETS.values() if t.status == "open"]
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tickets WHERE status = 'open'"
+        ).fetchall()
+    open_tickets = [_row_to_ticket(r) for r in rows]
 
     if len(open_tickets) < MIN_CLUSTER_SIZE:
         # Not enough data to form any incident — exit early
@@ -273,15 +277,52 @@ def detect_incidents_internal() -> list[Incident]:
     log.info(f"Stage 3 — scanning {len(open_tickets)} open tickets for incidents …")
 
     # ── Step 2: Embed all open ticket queries ─────────────────────────────────
-    texts = [t.query for t in open_tickets]
-    try:
-        embeddings = _embed_texts(texts)
-    except Exception as exc:
-        # Embedding can fail if the model has not been loaded yet (e.g. ChromaDB
-        # not initialised).  We log a warning and return gracefully so the calling
-        # Stage 2 escalation response is never blocked.
-        log.warning(f"Stage 3 embedding failed — detection skipped: {exc}")
+    # If the database already has the embedding stored, use it.
+    # Otherwise, compute it on the fly and save it.
+    embeddings_list = []
+    need_embed_indices = []
+    need_embed_texts = []
+
+    for i, t in enumerate(open_tickets):
+        if t.query_embedding:
+            embeddings_list.append((i, np.array(t.query_embedding, dtype=np.float32)))
+        else:
+            need_embed_indices.append(i)
+            need_embed_texts.append(t.query)
+
+    if need_embed_texts:
+        try:
+            computed_vectors = _embed_texts(need_embed_texts)
+            # Store computed embeddings back to the SQLite DB to avoid re-embedding
+            with get_db() as conn:
+                for idx, vector in zip(need_embed_indices, computed_vectors):
+                    vector_list = vector.tolist()
+                    open_tickets[idx].query_embedding = vector_list
+                    conn.execute(
+                        "UPDATE tickets SET query_embedding = ? WHERE ticket_id = ?",
+                        (json.dumps(vector_list), open_tickets[idx].ticket_id),
+                    )
+                    embeddings_list.append((idx, vector))
+        except Exception as exc:
+            log.warning(f"Stage 3 embedding fallback failed — detection skipped: {exc}")
+            return []
+
+    # Sort embeddings by their original ticket index to match open_tickets order
+    embeddings_list.sort(key=lambda x: x[0])
+    valid_tickets = []
+    valid_embeddings = []
+    for idx, emb in embeddings_list:
+        valid_tickets.append(open_tickets[idx])
+        valid_embeddings.append(emb)
+
+    if len(valid_tickets) < MIN_CLUSTER_SIZE:
+        log.debug(
+            f"Incident scan skipped: only {len(valid_tickets)} ticket(s) with embeddings, "
+            f"need >= {MIN_CLUSTER_SIZE}"
+        )
         return []
+
+    embeddings = np.array(valid_embeddings, dtype=np.float32)
 
     # ── Step 3: Greedy clustering ─────────────────────────────────────────────
     clusters = _greedy_cluster(embeddings)
@@ -294,7 +335,7 @@ def detect_incidents_internal() -> list[Incident]:
         if len(cluster_indices) < MIN_CLUSTER_SIZE:
             continue  # cluster too small to be an incident
 
-        cluster_tickets = [open_tickets[i] for i in cluster_indices]
+        cluster_tickets = [valid_tickets[i] for i in cluster_indices]
         ticket_ids      = sorted(t.ticket_id for t in cluster_tickets)
         ticket_ids_set  = frozenset(ticket_ids)
 
@@ -384,8 +425,11 @@ async def run_detection():
     Returns a summary of how many tickets were scanned and how many
     incidents were created or updated.
     """
-    from routers.tickets import _TICKETS
-    open_count = sum(1 for t in _TICKETS.values() if t.status == "open")
+    from database.db import get_db
+    with get_db() as conn:
+        open_count = conn.execute(
+            "SELECT COUNT(*) as count FROM tickets WHERE status = 'open'"
+        ).fetchone()["count"]
 
     affected = detect_incidents_internal()
 
