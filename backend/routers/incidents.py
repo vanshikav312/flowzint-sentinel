@@ -615,3 +615,40 @@ async def get_incident(incident_id: str):
             detail=f"Incident {incident_id} not found.",
         )
     return _row_to_incident(row)
+
+
+@router.patch("/{incident_id}/acknowledge", response_model=Incident)
+async def acknowledge_incident(incident_id: str):
+    """
+    Stage 4: Acknowledge an open incident.
+    Flips status: "open" → "acknowledged".
+    Returns 404 if not found, 409 if already acknowledged or resolved.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?",
+            (incident_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Incident {incident_id} not found.",
+            )
+        if row["status"] != "open":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident is already {row['status']}.",
+            )
+
+        updated_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE incidents
+               SET status = 'acknowledged',
+                   updated_at = ?
+             WHERE incident_id = ?
+            """,
+            (updated_at, incident_id),
+        )
+
+    return await get_incident(incident_id)

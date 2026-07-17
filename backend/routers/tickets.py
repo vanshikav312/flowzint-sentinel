@@ -139,6 +139,34 @@ async def list_tickets():
     return [_row_to_ticket(r, include_embedding=False) for r in rows]
 
 
+@router.get("/stats")
+async def ticket_stats():
+    """
+    Stage 4: Return open/resolved/total counts and average confidence.
+    Used by the admin dashboard stats row.
+    Must be registered before /{ticket_id} so FastAPI does not match
+    the literal string "stats" as a ticket ID path parameter.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*)                                                      AS total,
+                SUM(CASE WHEN status = 'open'     THEN 1 ELSE 0 END)         AS open,
+                SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END)         AS resolved,
+                AVG(confidence)                                               AS avg_confidence
+            FROM tickets
+            """
+        ).fetchone()
+
+    return {
+        "open":           int(row["open"] or 0),
+        "resolved":       int(row["resolved"] or 0),
+        "total":          int(row["total"] or 0),
+        "avg_confidence": round(float(row["avg_confidence"] or 0.0), 2),
+    }
+
+
 @router.get("/{ticket_id}", response_model=Ticket)
 async def get_ticket(ticket_id: str):
     """Return a single ticket by ID."""
