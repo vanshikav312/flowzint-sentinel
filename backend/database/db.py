@@ -1,13 +1,14 @@
 """
 database/db.py
-Lightweight SQLite persistence layer for tickets and KB drafts.
+Lightweight SQLite persistence layer for tickets, incidents, and KB drafts.
 
 Uses stdlib sqlite3 only — no extra dependencies.
 DB file lives at backend/database/sentinel.db (gitignored).
 
 Tables
 ------
-tickets  — one row per escalated ticket (Stage 2)
+tickets   — one row per escalated ticket (Stage 2)
+incidents — one row per detected incident cluster (Stage 3)
 kb_drafts — one row per pending/approved/rejected KB draft (Stage 5)
 """
 
@@ -59,6 +60,18 @@ def init_db() -> None:
                 resolved_at  TEXT DEFAULT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS incidents (
+                incident_id          TEXT PRIMARY KEY,
+                topic                TEXT NOT NULL,
+                ticket_ids           TEXT NOT NULL,   -- JSON array of ticket_id strings
+                ticket_count         INTEGER NOT NULL,
+                severity             TEXT NOT NULL,
+                status               TEXT NOT NULL DEFAULT 'open',
+                detected_at          TEXT NOT NULL,
+                updated_at           TEXT DEFAULT NULL,
+                similarity_threshold REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS kb_drafts (
                 draft_id         TEXT PRIMARY KEY,
                 title            TEXT NOT NULL,
@@ -69,3 +82,4 @@ def init_db() -> None:
                 reviewed_at      TEXT DEFAULT NULL
             );
         """)
+

@@ -18,20 +18,27 @@ knowledge base corpus is loaded (Razorpay docs, internal docs, any other).
 
 Algorithm (Greedy Cosine-Similarity Clustering)
 ------------------------------------------------
-1.  Pull every *open* ticket from the shared in-memory ticket store.
-2.  Embed each ticket's query using the sentence-transformers model that is
-    already loaded and LRU-cached by the chat router (Stage 1).  No second
-    model instance is created.
+1.  Pull every *open* ticket from SQLite.
+2.  Reuse the query_embedding already stored per ticket (written by Stage 2
+    at escalation time).  For any ticket without a stored embedding (e.g.
+    manual creations), compute it on the fly and persist it to the DB so
+    subsequent scans are free.
 3.  Run a greedy single-pass clustering sweep:
         • Pick the first unassigned ticket as a cluster seed.
         • Collect every other unassigned ticket whose cosine similarity to the
-          seed exceeds SIMILARITY_THRESHOLD.
+          seed meets or exceeds SIMILARITY_THRESHOLD.
         • Mark all collected tickets as assigned and form a cluster.
         • Repeat until all tickets have been visited.
 4.  Any cluster with >= MIN_CLUSTER_SIZE tickets becomes an Incident.
-5.  Deduplication: if an existing open Incident already covers the majority of
-    a cluster's tickets (>= 50% overlap), the existing incident is updated in
-    place rather than creating a duplicate.
+5.  Deduplication: if an existing open Incident in the database already covers
+    the majority of a cluster's tickets (>= 50% overlap), the existing incident
+    is updated in-place rather than creating a duplicate.
+
+Persistence
+-----------
+Incidents are stored in the `incidents` SQLite table defined in database/db.py.
+They survive server restarts and scale with the same durability guarantees as
+tickets and KB drafts.
 
 Why greedy clustering?
     • k-means requires knowing k in advance — we don't.
@@ -49,15 +56,19 @@ Endpoints exposed
 
 Auto-trigger
 ------------
-    detect_incidents_internal() is also imported and called directly by
-    chat.py immediately after Stage 2 creates a ticket, so the admin dashboard
-    stays current without requiring a manual /detect call.
+    detect_incidents_internal() is imported and called directly by
+    create_ticket_internal() in tickets.py immediately after every new ticket
+    is persisted, so the admin dashboard stays current without requiring a
+    manual /detect call.  Any ticket creation path (RAG escalation, Groq
+    failure, empty context, manual dashboard creation) automatically triggers
+    a scan.
 """
 
 from __future__ import annotations
 
-import uuid
+import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -65,13 +76,14 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from database.db import get_db
+
 log = logging.getLogger("incidents")
 
 router = APIRouter()
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
-# Lowered from the conservative production defaults to hackathon-demo values
-# so that incidents are easy to trigger with a handful of test queries.
+# Calibrated for the hackathon demo against all-MiniLM-L6-v2.
 # Change these constants to tune detection sensitivity.
 
 SIMILARITY_THRESHOLD = 0.50   # Cosine similarity required to group two tickets
@@ -83,12 +95,7 @@ SIMILARITY_THRESHOLD = 0.50   # Cosine similarity required to group two tickets
 
 MIN_CLUSTER_SIZE = 2           # Minimum number of tickets in a cluster for it
                                # to be promoted to an Incident.  Set to 2 for
-                               # the demo; 3–5 is more realistic for production.
-
-# ── In-memory incident store ──────────────────────────────────────────────────
-# Mirrors the _TICKETS and _DRAFTS pattern used in tickets.py and kb.py.
-# Dict maps incident_id -> Incident.
-_INCIDENTS: dict[str, "Incident"] = {}
+                               # the demo; 3-5 is more realistic for production.
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -99,14 +106,14 @@ class Incident(BaseModel):
     low-confidence tickets that collectively signal an emerging issue.
     """
     incident_id:          str
-    topic:                str                              # Query text from the seed (first) ticket in the cluster — used as the human-readable incident title
-    ticket_ids:           list[str]                        # All ticket IDs belonging to this cluster
-    ticket_count:         int                              # Convenience field; equals len(ticket_ids)
+    topic:                str        # Seed ticket query — human-readable incident title
+    ticket_ids:           list[str]  # All ticket IDs in this cluster
+    ticket_count:         int        # Convenience field; equals len(ticket_ids)
     severity:             Literal["low", "medium", "high", "critical"]
     status:               Literal["open", "acknowledged", "resolved"] = "open"
-    detected_at:          str                              # ISO-8601 UTC timestamp of first detection
-    updated_at:           str | None = None                # ISO-8601 UTC timestamp of last update (new tickets joined)
-    similarity_threshold: float                            # Threshold value used when this incident was detected — useful for audit/debugging
+    detected_at:          str        # ISO-8601 UTC timestamp of first detection
+    updated_at:           str | None = None  # ISO-8601 UTC timestamp of last update
+    similarity_threshold: float      # Threshold used when this incident was detected
 
 
 class DetectResponse(BaseModel):
@@ -114,6 +121,23 @@ class DetectResponse(BaseModel):
     scanned_tickets:    int
     incidents_detected: int
     incidents:          list[Incident]
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _row_to_incident(row) -> Incident:
+    """Convert a sqlite3.Row from the incidents table to an Incident model."""
+    return Incident(
+        incident_id          = row["incident_id"],
+        topic                = row["topic"],
+        ticket_ids           = json.loads(row["ticket_ids"]),
+        ticket_count         = row["ticket_count"],
+        severity             = row["severity"],
+        status               = row["status"],
+        detected_at          = row["detected_at"],
+        updated_at           = row["updated_at"],
+        similarity_threshold = row["similarity_threshold"],
+    )
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -133,7 +157,6 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     """
     from routers.chat import _get_embeddings          # reuse the cached singleton
     model = _get_embeddings()
-    # embed_documents returns list[list[float]]; convert to numpy for vectorised ops
     vectors = model.embed_documents(texts)
     return np.array(vectors, dtype=np.float32)
 
@@ -154,10 +177,10 @@ def _severity(ticket_count: int) -> str:
     Map the size of an incident's ticket cluster to a human-readable severity
     level for the admin dashboard.
 
-        2–4  tickets → low
-        5–7  tickets → medium
-        8–14 tickets → high
-        15+  tickets → critical
+        2-4  tickets -> low
+        5-7  tickets -> medium
+        8-14 tickets -> high
+        15+  tickets -> critical
     """
     if ticket_count >= 15:
         return "critical"
@@ -182,7 +205,7 @@ def _greedy_cluster(embeddings: np.ndarray) -> list[list[int]]:
     -------
     list[list[int]]
         A list of clusters.  Each cluster is a list of indices into the
-        `embeddings` array (and, correspondingly, into the `open_tickets` list
+        `embeddings` array (and correspondingly into the `valid_tickets` list
         passed to the caller).
     """
     n = len(embeddings)
@@ -193,7 +216,6 @@ def _greedy_cluster(embeddings: np.ndarray) -> list[list[int]]:
         if assigned[i]:
             continue  # already belongs to a cluster seeded by an earlier ticket
 
-        # Start a new cluster using ticket i as the seed
         cluster = [i]
         assigned[i] = True
 
@@ -212,8 +234,8 @@ def _greedy_cluster(embeddings: np.ndarray) -> list[list[int]]:
 
 def _find_existing_incident(ticket_ids_set: frozenset) -> Incident | None:
     """
-    Look for an existing *open* incident whose ticket set overlaps significantly
-    with the newly detected cluster.
+    Query the database for an existing *open* incident whose ticket set overlaps
+    significantly with the newly detected cluster.
 
     Overlap criterion: if >= 50% of the cluster's tickets are already tracked
     in an existing open incident, we treat them as the same incident (the
@@ -221,16 +243,16 @@ def _find_existing_incident(ticket_ids_set: frozenset) -> Incident | None:
 
     This prevents duplicate incidents accumulating across repeated /detect calls.
     """
-    for incident in _INCIDENTS.values():
-        if incident.status != "open":
-            continue  # only merge into open incidents
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM incidents WHERE status = 'open'"
+        ).fetchall()
 
-        existing_set = frozenset(incident.ticket_ids)
+    for row in rows:
+        existing_set = frozenset(json.loads(row["ticket_ids"]))
         overlap = len(ticket_ids_set & existing_set)
-
-        # Majority overlap → same underlying issue
         if overlap >= len(ticket_ids_set) * 0.5:
-            return incident
+            return _row_to_incident(row)
 
     return None
 
@@ -242,11 +264,14 @@ def detect_incidents_internal() -> list[Incident]:
     Run a full incident detection scan over the current open ticket store.
 
     This is the **central Stage 3 function**.  It is:
-        • Called automatically by chat.py after every Stage 2 ticket creation.
-        • Also callable manually via POST /api/incidents/detect.
+        * Called automatically by tickets.py after every ticket creation
+          (via create_ticket_internal), covering all escalation paths.
+        * Also callable manually via POST /api/incidents/detect.
 
-    The function is intentionally synchronous and lightweight — embedding a
-    few dozen ticket queries takes well under a second on CPU.
+    The function is intentionally synchronous and lightweight.  For tickets
+    escalated via the chat pipeline, query_embedding is already stored in
+    SQLite by Stage 2 — no model call is needed.  The embedding model is
+    only invoked for manually created tickets that lack a stored embedding.
 
     Returns
     -------
@@ -255,11 +280,9 @@ def detect_incidents_internal() -> list[Incident]:
         Returns an empty list if there are fewer open tickets than MIN_CLUSTER_SIZE
         or if embedding fails for any reason.
     """
-    # ── Step 1: Pull open tickets ─────────────────────────────────────────────
-    from database.db import get_db
     from routers.tickets import _row_to_ticket
-    import json
 
+    # ── Step 1: Pull open tickets from SQLite ─────────────────────────────────
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM tickets WHERE status = 'open'"
@@ -267,7 +290,6 @@ def detect_incidents_internal() -> list[Incident]:
     open_tickets = [_row_to_ticket(r) for r in rows]
 
     if len(open_tickets) < MIN_CLUSTER_SIZE:
-        # Not enough data to form any incident — exit early
         log.debug(
             f"Incident scan skipped: only {len(open_tickets)} open ticket(s), "
             f"need >= {MIN_CLUSTER_SIZE}"
@@ -276,12 +298,17 @@ def detect_incidents_internal() -> list[Incident]:
 
     log.info(f"Stage 3 — scanning {len(open_tickets)} open tickets for incidents …")
 
-    # ── Step 2: Embed all open ticket queries ─────────────────────────────────
-    # If the database already has the embedding stored, use it.
-    # Otherwise, compute it on the fly and save it.
-    embeddings_list = []
-    need_embed_indices = []
-    need_embed_texts = []
+    # ── Step 2: Resolve embeddings ────────────────────────────────────────────
+    # For tickets escalated via the RAG pipeline, query_embedding is already
+    # stored in the DB (written by chat.py at retrieval time).  We use those
+    # directly — zero model inference for the common path.
+    #
+    # For tickets without a stored embedding (e.g. manually created via the
+    # dashboard), we compute the embedding on the fly and write it back to the
+    # DB so subsequent scans remain free for those tickets too.
+    embeddings_list: list[tuple[int, np.ndarray]] = []
+    need_embed_indices: list[int] = []
+    need_embed_texts: list[str]   = []
 
     for i, t in enumerate(open_tickets):
         if t.query_embedding:
@@ -293,7 +320,6 @@ def detect_incidents_internal() -> list[Incident]:
     if need_embed_texts:
         try:
             computed_vectors = _embed_texts(need_embed_texts)
-            # Store computed embeddings back to the SQLite DB to avoid re-embedding
             with get_db() as conn:
                 for idx, vector in zip(need_embed_indices, computed_vectors):
                     vector_list = vector.tolist()
@@ -307,10 +333,11 @@ def detect_incidents_internal() -> list[Incident]:
             log.warning(f"Stage 3 embedding fallback failed — detection skipped: {exc}")
             return []
 
-    # Sort embeddings by their original ticket index to match open_tickets order
+    # Build ordered valid_tickets / embeddings arrays (exclude any ticket whose
+    # embedding could not be obtained)
     embeddings_list.sort(key=lambda x: x[0])
-    valid_tickets = []
-    valid_embeddings = []
+    valid_tickets: list = []
+    valid_embeddings: list[np.ndarray] = []
     for idx, emb in embeddings_list:
         valid_tickets.append(open_tickets[idx])
         valid_embeddings.append(emb)
@@ -330,58 +357,94 @@ def detect_incidents_internal() -> list[Incident]:
     now = datetime.now(timezone.utc).isoformat()
     affected: list[Incident] = []
 
-    # ── Step 4 & 5: Promote clusters → Incidents, with deduplication ──────────
+    # ── Steps 4 & 5: Promote clusters → Incidents, with deduplication ─────────
     for cluster_indices in clusters:
         if len(cluster_indices) < MIN_CLUSTER_SIZE:
-            continue  # cluster too small to be an incident
+            continue  # cluster too small — not an incident
 
         cluster_tickets = [valid_tickets[i] for i in cluster_indices]
         ticket_ids      = sorted(t.ticket_id for t in cluster_tickets)
         ticket_ids_set  = frozenset(ticket_ids)
 
-        # Deduplication: check if an existing open incident already covers
-        # the majority of these tickets (cluster grew since last scan)
         existing = _find_existing_incident(ticket_ids_set)
 
         if existing:
-            # ── Update existing incident in-place ─────────────────────────
-            # Merge new ticket IDs into the existing set (union) so the
-            # incident accurately reflects all affected tickets over time.
-            merged_ids           = sorted(ticket_ids_set | frozenset(existing.ticket_ids))
-            existing.ticket_ids  = merged_ids
-            existing.ticket_count = len(merged_ids)
-            existing.severity    = _severity(existing.ticket_count)
-            existing.updated_at  = now
-            _INCIDENTS[existing.incident_id] = existing
+            # ── Update existing incident in SQLite ────────────────────────────
+            merged_ids    = sorted(ticket_ids_set | frozenset(existing.ticket_ids))
+            new_count     = len(merged_ids)
+            new_severity  = _severity(new_count)
+
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    UPDATE incidents
+                       SET ticket_ids   = ?,
+                           ticket_count = ?,
+                           severity     = ?,
+                           updated_at   = ?
+                     WHERE incident_id  = ?
+                    """,
+                    (
+                        json.dumps(merged_ids),
+                        new_count,
+                        new_severity,
+                        now,
+                        existing.incident_id,
+                    ),
+                )
+
+            # Return the refreshed row to the caller
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM incidents WHERE incident_id = ?",
+                    (existing.incident_id,),
+                ).fetchone()
+            updated = _row_to_incident(row)
 
             log.info(
-                f"Incident {existing.incident_id} updated — "
-                f"{existing.ticket_count} tickets, severity={existing.severity}"
+                f"Incident {updated.incident_id} updated — "
+                f"{updated.ticket_count} tickets, severity={updated.severity}"
             )
-            affected.append(existing)
+            affected.append(updated)
 
         else:
-            # ── Create new incident ───────────────────────────────────────
-            # Use the seed ticket's query as the human-readable topic label.
-            # The seed is the first ticket encountered in the sweep — it is
-            # representative of the cluster but not necessarily the "best"
-            # label.  Admins can rename incidents in a future UI iteration.
-            seed_query = cluster_tickets[0].query
+            # ── Insert new incident into SQLite ───────────────────────────────
+            seed_query  = cluster_tickets[0].query
+            incident_id = f"INC-{uuid.uuid4().hex[:8].upper()}"
+            severity    = _severity(len(ticket_ids))
+
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO incidents
+                        (incident_id, topic, ticket_ids, ticket_count,
+                         severity, status, detected_at, similarity_threshold)
+                    VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+                    """,
+                    (
+                        incident_id,
+                        seed_query,
+                        json.dumps(ticket_ids),
+                        len(ticket_ids),
+                        severity,
+                        now,
+                        SIMILARITY_THRESHOLD,
+                    ),
+                )
 
             incident = Incident(
-                incident_id          = f"INC-{uuid.uuid4().hex[:8].upper()}",
+                incident_id          = incident_id,
                 topic                = seed_query,
                 ticket_ids           = ticket_ids,
                 ticket_count         = len(ticket_ids),
-                severity             = _severity(len(ticket_ids)),
+                severity             = severity,
                 detected_at          = now,
                 similarity_threshold = SIMILARITY_THRESHOLD,
             )
-            _INCIDENTS[incident.incident_id] = incident
 
             log.info(
-                f"New incident {incident.incident_id} detected — "
-                f"{incident.ticket_count} tickets, severity={incident.severity}, "
+                f"New incident {incident_id} detected — "
+                f"{len(ticket_ids)} tickets, severity={severity}, "
                 f"topic: {seed_query!r}"
             )
             affected.append(incident)
@@ -404,11 +467,11 @@ async def list_incidents():
     Both open and acknowledged incidents are returned; resolved incidents
     are included for audit purposes.
     """
-    return sorted(
-        _INCIDENTS.values(),
-        key=lambda inc: inc.detected_at,
-        reverse=True,
-    )
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM incidents ORDER BY detected_at DESC"
+        ).fetchall()
+    return [_row_to_incident(r) for r in rows]
 
 
 @router.post("/detect", response_model=DetectResponse)
@@ -416,16 +479,15 @@ async def run_detection():
     """
     Stage 3: Manually trigger an incident detection scan.
 
-    While detection is also triggered automatically after each Stage 2
-    escalation, this endpoint is useful for:
-        • Forcing a fresh scan at any time from the admin dashboard.
-        • Testing the detection logic during development.
-        • Re-evaluating incidents after tickets are resolved.
+    While detection is also triggered automatically after each ticket creation,
+    this endpoint is useful for:
+        * Forcing a fresh scan at any time from the admin dashboard.
+        * Testing the detection logic during development.
+        * Re-evaluating incidents after tickets are resolved.
 
     Returns a summary of how many tickets were scanned and how many
     incidents were created or updated.
     """
-    from database.db import get_db
     with get_db() as conn:
         open_count = conn.execute(
             "SELECT COUNT(*) as count FROM tickets WHERE status = 'open'"
@@ -448,10 +510,14 @@ async def get_incident(incident_id: str):
     Useful for the admin dashboard detail view — shows which specific
     tickets constitute the incident cluster.
     """
-    incident = _INCIDENTS.get(incident_id)
-    if not incident:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?",
+            (incident_id,),
+        ).fetchone()
+    if not row:
         raise HTTPException(
             status_code=404,
-            detail=f"Incident {incident_id} not found."
+            detail=f"Incident {incident_id} not found.",
         )
-    return incident
+    return _row_to_incident(row)

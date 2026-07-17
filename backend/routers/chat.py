@@ -398,17 +398,6 @@ def chat(body: ChatRequest):
         ticket_id = ticket.ticket_id
         log.info(f"Blended confidence {blended_confidence} below threshold — escalated to {ticket_id}")
 
-        # ── Stage 3 hook ──────────────────────────────────────────────────────
-        # Auto-trigger incident detection immediately after a new escalation
-        # ticket is created (Option A: auto-trigger).  Kept inside a try/except
-        # so that any detection failure is logged as a non-fatal warning and
-        # the escalation response is always returned to the user.
-        try:
-            from routers.incidents import detect_incidents_internal
-            detect_incidents_internal()
-        except Exception as _inc_err:
-            log.warning(f"Stage 3 incident detection skipped after ticket creation: {_inc_err}")
-
         return ChatResponse(
             answer=(
                 "I'm not confident enough to answer this accurately. "

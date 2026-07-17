@@ -94,7 +94,7 @@ def create_ticket_internal(
             ),
         )
 
-    return Ticket(
+    ticket = Ticket(
         ticket_id       = ticket_id,
         query           = query,
         confidence      = confidence,
@@ -102,6 +102,23 @@ def create_ticket_internal(
         query_embedding = query_embedding,
         created_at      = created_at,
     )
+
+    # ── Stage 3 auto-trigger ──────────────────────────────────────────────────
+    # Centralised here so every ticket creation path (RAG escalation, Groq
+    # failure, empty context, manual dashboard creation) automatically kicks
+    # off an incident scan.  The lazy import avoids a circular import between
+    # tickets.py and incidents.py.  A bare except ensures that any detection
+    # failure is only logged as a warning and never blocks ticket creation.
+    try:
+        from routers.incidents import detect_incidents_internal
+        detect_incidents_internal()
+    except Exception as _inc_err:
+        import logging as _log
+        _log.getLogger("tickets").warning(
+            f"Stage 3 incident detection skipped after ticket {ticket_id}: {_inc_err}"
+        )
+
+    return ticket
 
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
