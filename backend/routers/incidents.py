@@ -16,37 +16,47 @@ that an admin should be aware of proactively.
 This module is company-agnostic: it works identically regardless of which
 knowledge base corpus is loaded (Razorpay docs, internal docs, any other).
 
-Algorithm (Greedy Cosine-Similarity Clustering)
-------------------------------------------------
-1.  Pull every *open* ticket from SQLite.
+Algorithm (Centroid-Based Cosine-Similarity Clustering)
+--------------------------------------------------------
+1.  Pull every *open* ticket created within the rolling INCIDENT_WINDOW_MINUTES
+    window from SQLite.  Older tickets are excluded so incidents represent recent
+    bursts, not accumulated history.
 2.  Reuse the query_embedding already stored per ticket (written by Stage 2
     at escalation time).  For any ticket without a stored embedding (e.g.
     manual creations), compute it on the fly and persist it to the DB so
     subsequent scans are free.
-3.  Run a greedy single-pass clustering sweep:
+3.  Run a centroid-based iterative clustering sweep:
         • Pick the first unassigned ticket as a cluster seed.
-        • Collect every other unassigned ticket whose cosine similarity to the
-          seed meets or exceeds SIMILARITY_THRESHOLD.
-        • Mark all collected tickets as assigned and form a cluster.
-        • Repeat until all tickets have been visited.
+        • Compute the cluster centroid = L2-normalized mean of all current
+          member embeddings.
+        • Sweep all unassigned tickets; add those whose cosine similarity to
+          the centroid meets or exceeds SIMILARITY_THRESHOLD.
+        • After each expansion round, recompute the centroid and sweep again
+          until no new tickets join (stable cluster).
+        • Repeat from the next unassigned ticket as a new seed.
 4.  Any cluster with >= MIN_CLUSTER_SIZE tickets becomes an Incident.
 5.  Deduplication: if an existing open Incident in the database already covers
     the majority of a cluster's tickets (>= 50% overlap), the existing incident
     is updated in-place rather than creating a duplicate.
+
+Why centroid-based over seed-only greedy?
+    • Seed-only: a ticket is admitted only if similar to the *first* ticket
+      picked.  If the seed is an edge case, nearby tickets are incorrectly
+      excluded (e.g. "transaction failed" excluded from a payment cluster
+      because seed similarity = 0.489 < threshold).
+    • Centroid-based: after each admission the centroid shifts toward the true
+      cluster center, pulling in tickets that are similar to the group as a
+      whole even if they were not close to the original seed.
+    • The centroid is the mean of *all* current member embeddings, so a single
+      drifting member cannot drag the centroid far off-topic.
+    • Still O(n² × passes); passes ≈ 1–2 in practice, well within budget for
+      support ticket volumes (n << 1000).
 
 Persistence
 -----------
 Incidents are stored in the `incidents` SQLite table defined in database/db.py.
 They survive server restarts and scale with the same durability guarantees as
 tickets and KB drafts.
-
-Why greedy clustering?
-    • k-means requires knowing k in advance — we don't.
-    • DBSCAN adds a sklearn dependency and is overkill at this scale.
-    • Greedy single-pass is O(n²) which is perfectly fine for a support ticket
-      store of tens to hundreds of tickets, and is easy to explain during judging.
-    • Zero extra dependencies — numpy is already a transitive dep of
-      sentence-transformers.
 
 Endpoints exposed
 -----------------
@@ -68,8 +78,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import numpy as np
@@ -96,6 +107,13 @@ SIMILARITY_THRESHOLD = 0.50   # Cosine similarity required to group two tickets
 MIN_CLUSTER_SIZE = 2           # Minimum number of tickets in a cluster for it
                                # to be promoted to an Incident.  Set to 2 for
                                # the demo; 3-5 is more realistic for production.
+
+INCIDENT_WINDOW_MINUTES = int(os.getenv("INCIDENT_WINDOW_MINUTES", "30"))
+                               # Rolling time window: only tickets created within
+                               # this many minutes are eligible for clustering.
+                               # Override via INCIDENT_WINDOW_MINUTES env var.
+                               # 30 min is the default for the hackathon demo;
+                               # 60-240 min is more typical for production.
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -191,15 +209,27 @@ def _severity(ticket_count: int) -> str:
     return "low"
 
 
-def _greedy_cluster(embeddings: np.ndarray) -> list[list[int]]:
+def _centroid_cluster(embeddings: np.ndarray) -> list[list[int]]:
     """
-    Greedy single-pass clustering over a list of embedding vectors.
+    Centroid-based iterative clustering over a list of embedding vectors.
 
-    For each unassigned ticket (used as the cluster *seed*), this function
-    sweeps all remaining unassigned tickets and groups those whose cosine
-    similarity to the seed meets or exceeds SIMILARITY_THRESHOLD.
+    Improvement over seed-only greedy:
+        Seed-only compares every candidate against the *first* ticket in the
+        cluster, which may sit at the semantic edge of the group.  Centroid-based
+        computes the normalized mean of all current cluster members after each
+        expansion round, then sweeps again.  This allows tickets that are
+        similar to the cluster *as a whole* — but not to the original seed —
+        to join correctly.
 
-    Complexity: O(n²) — acceptable for support ticket volumes (n << 1000).
+    Algorithm per cluster:
+        1. Seed with ticket i.  Centroid = embeddings[i].
+        2. Sweep all unassigned tickets; collect those >= SIMILARITY_THRESHOLD
+           against the current centroid.
+        3. If new members were found: add them, recompute centroid, go to 2.
+        4. If no new members: cluster is stable; move to the next seed.
+
+    Complexity: O(n² × passes_per_cluster).  In practice passes ≈ 1-2,
+    making the overall cost barely distinguishable from O(n²).
 
     Returns
     -------
@@ -219,13 +249,30 @@ def _greedy_cluster(embeddings: np.ndarray) -> list[list[int]]:
         cluster = [i]
         assigned[i] = True
 
-        for j in range(i + 1, n):
-            if assigned[j]:
-                continue
-            sim = _cosine_sim(embeddings[i], embeddings[j])
-            if sim >= SIMILARITY_THRESHOLD:
+        # Iteratively expand until the cluster is stable
+        while True:
+            # Recompute normalised centroid from all current members
+            centroid = embeddings[cluster].mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+
+            # Sweep unassigned tickets against the updated centroid
+            new_members: list[int] = []
+            for j in range(n):
+                if assigned[j]:
+                    continue
+                sim = _cosine_sim(centroid, embeddings[j])
+                if sim >= SIMILARITY_THRESHOLD:
+                    new_members.append(j)
+
+            if not new_members:
+                break  # no change — cluster is stable
+
+            for j in new_members:
                 cluster.append(j)
                 assigned[j] = True
+            # centroid will be recomputed at the top of the next iteration
 
         clusters.append(cluster)
 
@@ -282,21 +329,36 @@ def detect_incidents_internal() -> list[Incident]:
     """
     from routers.tickets import _row_to_ticket
 
-    # ── Step 1: Pull open tickets from SQLite ─────────────────────────────────
+    # ── Step 1: Pull recent open tickets from SQLite ─────────────────────────
+    # Only tickets within the rolling INCIDENT_WINDOW_MINUTES window are
+    # considered.  This ensures incidents represent current surges, not tickets
+    # accumulated over days or weeks.
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(minutes=INCIDENT_WINDOW_MINUTES)
+    ).isoformat()
+
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM tickets WHERE status = 'open'"
+            """
+            SELECT * FROM tickets
+             WHERE status = 'open'
+               AND created_at >= ?
+            """,
+            (window_start,),
         ).fetchall()
     open_tickets = [_row_to_ticket(r) for r in rows]
 
     if len(open_tickets) < MIN_CLUSTER_SIZE:
         log.debug(
-            f"Incident scan skipped: only {len(open_tickets)} open ticket(s), "
-            f"need >= {MIN_CLUSTER_SIZE}"
+            f"Incident scan skipped: only {len(open_tickets)} open ticket(s) "
+            f"in the last {INCIDENT_WINDOW_MINUTES} min, need >= {MIN_CLUSTER_SIZE}"
         )
         return []
 
-    log.info(f"Stage 3 — scanning {len(open_tickets)} open tickets for incidents …")
+    log.info(
+        f"Stage 3 — scanning {len(open_tickets)} open ticket(s) "
+        f"from the last {INCIDENT_WINDOW_MINUTES} min …"
+    )
 
     # ── Step 2: Resolve embeddings ────────────────────────────────────────────
     # For tickets escalated via the RAG pipeline, query_embedding is already
@@ -351,8 +413,8 @@ def detect_incidents_internal() -> list[Incident]:
 
     embeddings = np.array(valid_embeddings, dtype=np.float32)
 
-    # ── Step 3: Greedy clustering ─────────────────────────────────────────────
-    clusters = _greedy_cluster(embeddings)
+    # ── Step 3: Centroid-based clustering ────────────────────────────────────
+    clusters = _centroid_cluster(embeddings)
 
     now = datetime.now(timezone.utc).isoformat()
     affected: list[Incident] = []
