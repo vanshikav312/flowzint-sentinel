@@ -134,7 +134,8 @@ class Incident(BaseModel):
     incident_id:          str
     topic:                str        # Seed ticket query — human-readable incident title
     ticket_ids:           list[str]  # All ticket IDs in this cluster
-    ticket_count:         int        # Convenience field; equals len(ticket_ids)
+    ticket_count:         int        # Total reports = len(ticket_ids) + extra_reports
+    extra_reports:        int = 0    # Reports attached WITHOUT a separate ticket
     severity:             Literal["low", "medium", "high", "critical"]
     status:               Literal["open", "acknowledged", "resolved"] = "open"
     detected_at:          str        # ISO-8601 UTC timestamp of first detection
@@ -158,6 +159,7 @@ def _row_to_incident(row) -> Incident:
         topic                = row["topic"],
         ticket_ids           = json.loads(row["ticket_ids"]),
         ticket_count         = row["ticket_count"],
+        extra_reports        = row["extra_reports"],
         severity             = row["severity"],
         status               = row["status"],
         detected_at          = row["detected_at"],
@@ -311,6 +313,99 @@ def _find_existing_incident(
     return None
 
 
+def find_matching_open_incident(query_embedding: list[float] | None) -> Incident | None:
+    """
+    Stage 3.5 — check whether a NEW low-confidence query belongs to an
+    already-detected open incident, BEFORE a ticket is created for it.
+
+    Method: compare the query's embedding against the centroid (normalized
+    mean) of each open incident's member-ticket embeddings — the same
+    "similar to the group's average meaning" rule the clusterer uses.
+    Returns the best match at or above SIMILARITY_THRESHOLD, else None.
+    """
+    if not query_embedding:
+        return None
+    q = np.array(query_embedding, dtype=np.float32)
+
+    best_row, best_sim = None, 0.0
+    with get_db() as conn:
+        incident_rows = conn.execute(
+            "SELECT * FROM incidents WHERE status = 'open'"
+        ).fetchall()
+        for row in incident_rows:
+            ticket_ids = json.loads(row["ticket_ids"])
+            if not ticket_ids:
+                continue
+            placeholders = ",".join("?" * len(ticket_ids))
+            emb_rows = conn.execute(
+                f"SELECT query_embedding FROM tickets WHERE ticket_id IN ({placeholders})",
+                ticket_ids,
+            ).fetchall()
+            vectors = [
+                json.loads(r["query_embedding"])
+                for r in emb_rows
+                if r["query_embedding"]
+            ]
+            if not vectors:
+                continue
+            centroid = np.mean(np.array(vectors, dtype=np.float32), axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm == 0:
+                continue
+            sim = _cosine_sim(centroid / norm, q)
+            if sim >= SIMILARITY_THRESHOLD and sim > best_sim:
+                best_row, best_sim = row, sim
+
+    if best_row is None:
+        return None
+    log.info(
+        f"Query matches open incident {best_row['incident_id']} "
+        f"(centroid similarity {best_sim:.3f})"
+    )
+    return _row_to_incident(best_row)
+
+
+def attach_report_to_incident(incident_id: str) -> Incident:
+    """
+    Stage 3.5 — count a new customer report against an existing incident
+    WITHOUT opening a separate ticket: resolving the incident resolves all
+    attached reports, so duplicate tickets would only create busywork.
+
+    Increments extra_reports and ticket_count, recomputes severity from the
+    new total, and bumps updated_at so the dashboard shows fresh activity.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Incident {incident_id} not found")
+
+        new_count = row["ticket_count"] + 1
+        conn.execute(
+            """
+            UPDATE incidents
+               SET extra_reports = ?,
+                   ticket_count  = ?,
+                   severity      = ?,
+                   updated_at    = ?
+             WHERE incident_id  = ?
+            """,
+            (row["extra_reports"] + 1, new_count, _severity(new_count), now, incident_id),
+        )
+        updated_row = conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+        ).fetchone()
+
+    incident = _row_to_incident(updated_row)
+    log.info(
+        f"Report attached to incident {incident_id} — "
+        f"now {incident.ticket_count} total reports, severity={incident.severity}"
+    )
+    return incident
+
+
 # ── Core detection logic ──────────────────────────────────────────────────────
 
 def detect_incidents_internal() -> list[Incident]:
@@ -451,7 +546,8 @@ def detect_incidents_internal() -> list[Incident]:
         if existing:
             # ── Update existing incident in SQLite ────────────────────────────
             merged_ids    = sorted(ticket_ids_set | frozenset(existing.ticket_ids))
-            new_count     = len(merged_ids)
+            # Total reports = clustered tickets + reports attached without a ticket
+            new_count     = len(merged_ids) + existing.extra_reports
             new_severity  = _severity(new_count)
 
             with get_db() as conn:
@@ -480,6 +576,7 @@ def detect_incidents_internal() -> list[Incident]:
                 topic                = existing.topic,
                 ticket_ids           = merged_ids,
                 ticket_count         = new_count,
+                extra_reports        = existing.extra_reports,
                 severity             = new_severity,
                 status               = existing.status,
                 detected_at          = existing.detected_at,

@@ -10,6 +10,7 @@ interface Message {
   confidence?: number;
   escalated?: boolean;
   ticket_id?: string;
+  incident_id?: string;
 }
 
 function ConfidenceBadge({ score }: { score: number }) {
@@ -68,6 +69,7 @@ export default function ChatPage() {
         confidence: data.confidence,
         escalated: data.escalate,
         ticket_id: data.ticket_id,
+        incident_id: data.incident_id,
       };
 
       setMessages((prev) => [...prev, botMsg]);
@@ -143,13 +145,30 @@ export default function ChatPage() {
                   </div>
                 )}
 
-                {/* Escalation notice */}
+                {/* Escalation notice — new ticket opened */}
                 {msg.escalated && msg.ticket_id && (
                   <div className="mt-2 flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2">
                     <span className="text-amber-400 text-xs">⚠️</span>
                     <p className="text-xs text-amber-300">
                       Escalated to human agent · Ticket ID:{" "}
                       <span className="font-mono font-semibold">{msg.ticket_id}</span>
+                      {msg.incident_id && (
+                        <>
+                          {" "}· linked to investigation{" "}
+                          <span className="font-mono font-semibold">{msg.incident_id}</span>
+                        </>
+                      )}
+                    </p>
+                  </div>
+                )}
+
+                {/* Known-issue notice — report absorbed by an existing incident */}
+                {msg.escalated && !msg.ticket_id && msg.incident_id && (
+                  <div className="mt-2 flex items-center gap-2 bg-sky-500/10 border border-sky-500/30 rounded-lg px-3 py-2">
+                    <span className="text-sky-400 text-xs">🛠️</span>
+                    <p className="text-xs text-sky-300">
+                      Known issue — our team is already on it · Ref:{" "}
+                      <span className="font-mono font-semibold">{msg.incident_id}</span>
                     </p>
                   </div>
                 )}

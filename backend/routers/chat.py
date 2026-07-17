@@ -272,9 +272,10 @@ class SourceRef(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    confidence: float             # 0-100 scale from LLM
-    escalate: bool                # True if confidence < 40
-    ticket_id: str | None = None  # set when escalated (Stage 2)
+    confidence: float               # 0-100 blended scale
+    escalate: bool                  # True if confidence < 40
+    ticket_id: str | None = None    # set when a new ticket was opened (Stage 2)
+    incident_id: str | None = None  # set when the query matched/joined an incident (Stage 3)
     sources: list[SourceRef]
 
 
@@ -388,6 +389,49 @@ def chat(body: ChatRequest):
 
     ticket_id = None
     if escalate:
+        # ── Stage 3.5: incident-aware escalation ──────────────────────────────
+        # Case A — the query matches an existing OPEN incident: don't open yet
+        # another ticket. Resolving the incident resolves every attached report,
+        # so a duplicate ticket would only create busywork. Count the report
+        # under the incident and reassure the customer it's already known.
+        try:
+            from routers.incidents import (
+                attach_report_to_incident,
+                find_matching_open_incident,
+            )
+            matched = find_matching_open_incident(query_embedding)
+        except Exception as e:
+            log.warning(f"Incident match check failed — falling back to ticket: {e}")
+            matched = None
+
+        if matched:
+            try:
+                incident = attach_report_to_incident(matched.incident_id)
+            except Exception as e:
+                log.warning(f"Attach to {matched.incident_id} failed, using match as-is: {e}")
+                incident = matched
+            log.info(
+                f"Escalation absorbed by incident {incident.incident_id} "
+                f"({incident.ticket_count} total reports) — no new ticket"
+            )
+            return ChatResponse(
+                answer=(
+                    "Thanks for flagging this — it has already come to our notice. "
+                    "Several customers have reported the same problem and our team is "
+                    f"actively working on it (ref: {incident.incident_id}). Your report "
+                    "has been added to that investigation, so it will be resolved along "
+                    "with the others — no separate ticket needed. We appreciate your patience!"
+                ),
+                confidence=blended_confidence,
+                escalate=True,
+                ticket_id=None,
+                incident_id=incident.incident_id,
+                sources=sources,
+            )
+
+        # Case B/C — no existing incident matched: open a ticket as usual.
+        # (Ticket creation auto-runs a detection scan, so this very ticket may
+        # form or join an incident right now — check and tell the customer.)
         from routers.tickets import create_ticket_internal
         ticket = create_ticket_internal(
             query           = query,
@@ -398,15 +442,43 @@ def chat(body: ChatRequest):
         ticket_id = ticket.ticket_id
         log.info(f"Blended confidence {blended_confidence} below threshold — escalated to {ticket_id}")
 
-        return ChatResponse(
-            answer=(
+        joined_incident_id: str | None = None
+        try:
+            from database.db import get_db
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT incident_id FROM incidents "
+                    "WHERE status = 'open' AND ticket_ids LIKE ?",
+                    (f'%"{ticket_id}"%',),
+                ).fetchone()
+            if row:
+                joined_incident_id = row["incident_id"]
+        except Exception as e:
+            log.warning(f"Post-ticket incident lookup failed: {e}")
+
+        if joined_incident_id:
+            # Case B — this ticket just formed/joined a cluster
+            answer_text = (
+                "I'm not confident enough to answer this accurately, so I've "
+                f"escalated it to a human agent (Ticket: {ticket_id}). We've also "
+                "noticed similar recent reports — your ticket has been linked to an "
+                f"active investigation (ref: {joined_incident_id}) that our team is "
+                "already working on."
+            )
+        else:
+            # Case C — genuinely new, standalone issue
+            answer_text = (
                 "I'm not confident enough to answer this accurately. "
                 f"Your query has been escalated to a human agent (Ticket: {ticket_id}). "
                 "You will receive a response shortly."
-            ),
+            )
+
+        return ChatResponse(
+            answer=answer_text,
             confidence=blended_confidence,
             escalate=True,
             ticket_id=ticket_id,
+            incident_id=joined_incident_id,
             sources=sources,
         )
 

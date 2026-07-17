@@ -69,7 +69,8 @@ def init_db() -> None:
                 status               TEXT NOT NULL DEFAULT 'open',
                 detected_at          TEXT NOT NULL,
                 updated_at           TEXT DEFAULT NULL,
-                similarity_threshold REAL NOT NULL
+                similarity_threshold REAL NOT NULL,
+                extra_reports        INTEGER NOT NULL DEFAULT 0  -- reports attached without a ticket
             );
 
             CREATE TABLE IF NOT EXISTS kb_drafts (
@@ -82,4 +83,13 @@ def init_db() -> None:
                 reviewed_at      TEXT DEFAULT NULL
             );
         """)
+
+        # Migration for DBs created before the extra_reports column existed
+        # (CREATE TABLE IF NOT EXISTS won't add columns to an existing table).
+        try:
+            conn.execute(
+                "ALTER TABLE incidents ADD COLUMN extra_reports INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already present
 
