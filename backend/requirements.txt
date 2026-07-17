@@ -21,3 +21,6 @@ uvicorn[standard]
 
 # Environment config
 python-dotenv
+
+# Lets pydantic evaluate modern type syntax (str | None) on Python 3.9
+eval_type_backport

@@ -113,6 +113,19 @@ def _get_groq_client():
     return Groq(api_key=api_key)
 
 
+def warmup() -> None:
+    """
+    Pre-load all heavy singletons at server startup so the first chat request
+    doesn't pay ~10s of lazy loading. Missing index/key is logged, not fatal —
+    the server must still boot before ingestion has been run.
+    """
+    for loader in (_get_embeddings, _get_vectorstore, _get_bm25, _get_groq_client):
+        try:
+            loader()
+        except Exception as e:
+            log.warning(f"Warmup: {loader.__name__} skipped — {e}")
+
+
 # ── Retrieval helpers ─────────────────────────────────────────────────────────
 
 def _dense_retrieve(query: str) -> list[tuple[str, dict, float]]:
@@ -223,7 +236,8 @@ def _call_groq(query: str, context: str) -> tuple[str, float]:
     raw = completion.choices[0].message.content or ""
 
     # Parse CONFIDENCE: <number> from the last line
-    confidence: float = 50.0  # default fallback
+    # Default is 0.0 (fail-safe): if the LLM omits the line, escalate rather than ship unvetted answer
+    confidence: float = 0.0
     answer = raw.strip()
 
     lines = raw.strip().splitlines()
@@ -267,10 +281,14 @@ class ChatResponse(BaseModel):
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/", response_model=ChatResponse)
-async def chat(body: ChatRequest):
+def chat(body: ChatRequest):
     """
     Stage 1: Hybrid RAG answer pipeline.
     Dense (ChromaDB) + Sparse (BM25) → RRF fusion → Groq LLM → response.
+
+    Deliberately sync (no `async`): the embedding model and the Groq HTTP call
+    are blocking, so FastAPI must run this in its threadpool to avoid stalling
+    the event loop for concurrent users.
     """
     query = body.query.strip()
     if not query:
@@ -287,15 +305,37 @@ async def chat(body: ChatRequest):
 
     log.info(f"Dense hits: {len(dense_results)} | Sparse hits: {len(sparse_results)}")
 
+    # Capture top dense similarity score for confidence blending (Bug 2 fix)
+    # dense_results are (text, meta, similarity) where similarity = 1 - cosine_distance
+    top_dense_similarity = dense_results[0][2] if dense_results else 0.0
+
+    # Capture query embedding now (cheapest moment — model already loaded)
+    # Used by Stage 3 clustering on tickets
+    try:
+        query_embedding: list[float] = _get_embeddings().embed_query(query)
+    except Exception:
+        query_embedding = []
+
     # 2. Fuse
     fused = _reciprocal_rank_fusion(dense_results, sparse_results)
     log.info(f"Fused top-{FUSION_TOP_K} chunks selected")
 
     if not fused:
+        from routers.tickets import create_ticket_internal
+        ticket = create_ticket_internal(
+            query           = query,
+            confidence      = 0.0,
+            sources         = [],
+            query_embedding = query_embedding,
+        )
         return ChatResponse(
-            answer="I couldn't find any relevant information for your question.",
-            confidence=0,
+            answer=(
+                "I couldn't find any relevant information for your question. "
+                f"Your query has been escalated to a human agent (Ticket: {ticket.ticket_id})."
+            ),
+            confidence=0.0,
             escalate=True,
+            ticket_id=ticket.ticket_id,
             sources=[],
         )
 
@@ -305,8 +345,32 @@ async def chat(body: ChatRequest):
         answer, confidence = _call_groq(query, context)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        # Groq rate limits (RateLimitError), network failures (APIConnectionError),
+        # and other groq.APIError subclasses all land here.
+        # Safe failure: escalate rather than surface a raw 500.
+        log.warning(f"Groq API error: {e}")
+        from routers.tickets import create_ticket_internal
+        ticket = create_ticket_internal(
+            query           = query,
+            confidence      = 0.0,
+            sources         = [],
+            query_embedding = query_embedding,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"The AI service is temporarily unavailable (rate limit or network error). "
+                f"Your query has been escalated (Ticket: {ticket.ticket_id})."
+            ),
+        )
 
-    log.info(f"Confidence: {confidence}")
+    log.info(f"LLM confidence: {confidence} | Top dense similarity: {top_dense_similarity:.3f}")
+
+    # Blend: 40% LLM self-reported + 60% retrieval similarity (scaled to 0-100)
+    # This prevents small models from faking high confidence on irrelevant queries.
+    blended_confidence = round(0.4 * confidence + 0.6 * top_dense_similarity * 100, 1)
+    log.info(f"Blended confidence: {blended_confidence}")
 
     # 4. Build source refs
     sources = [
@@ -320,18 +384,19 @@ async def chat(body: ChatRequest):
 
     # ── Stage 2: Confidence Router ────────────────────────────────────────────
     ESCALATION_THRESHOLD = 40
-    escalate = confidence < ESCALATION_THRESHOLD
+    escalate = blended_confidence < ESCALATION_THRESHOLD
 
     ticket_id = None
     if escalate:
         from routers.tickets import create_ticket_internal
         ticket = create_ticket_internal(
-            query=query,
-            confidence=confidence,
-            sources=[s.model_dump() for s in sources],
+            query           = query,
+            confidence      = blended_confidence,
+            sources         = [s.model_dump() for s in sources],
+            query_embedding = query_embedding,
         )
         ticket_id = ticket.ticket_id
-        log.info(f"Low confidence ({confidence}) — escalated to ticket {ticket_id}")
+        log.info(f"Blended confidence {blended_confidence} below threshold — escalated to {ticket_id}")
 
         # ── Stage 3 hook ──────────────────────────────────────────────────────
         # Auto-trigger incident detection immediately after a new escalation
@@ -350,7 +415,7 @@ async def chat(body: ChatRequest):
                 f"Your query has been escalated to a human agent (Ticket: {ticket_id}). "
                 "You will receive a response shortly."
             ),
-            confidence=confidence,
+            confidence=blended_confidence,
             escalate=True,
             ticket_id=ticket_id,
             sources=sources,
@@ -358,7 +423,7 @@ async def chat(body: ChatRequest):
 
     return ChatResponse(
         answer=answer,
-        confidence=confidence,
+        confidence=blended_confidence,
         escalate=False,
         ticket_id=None,
         sources=sources,

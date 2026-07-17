@@ -2,16 +2,33 @@
 FlowZint Sentinel — FastAPI Entrypoint
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Initialise SQLite tables (no-op if they already exist)
+from database.db import init_db
+init_db()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pre-load the embedding model, ChromaDB, BM25 index and Groq client
+    # so the first chat request answers instantly instead of lazy-loading.
+    from routers.chat import warmup
+    warmup()
+    yield
+
+
 app = FastAPI(
     title="FlowZint Sentinel",
     description="Self-healing AI support bot with hybrid RAG and confidence routing.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # Allow the Next.js frontend (dev) to talk to the backend

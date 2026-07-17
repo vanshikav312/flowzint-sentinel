@@ -2,16 +2,17 @@
 Router: /api/tickets
 Stage 2 — Confidence Router feeds into this module.
 
-When chat.py determines confidence < ESCALATION_THRESHOLD, it calls
-create_ticket_internal() directly to create a ticket and returns an
-escalation response to the user instead of the low-confidence answer.
+Persistence: SQLite via database/db.py (survives --reload and server restarts).
 
-Stage 4 (Human Resolution) will use PATCH /{ticket_id}/resolve to
-mark a ticket as resolved and store the resolution as a KB draft.
+Each ticket stores:
+  - query embedding (list[float]) — captured at creation for Stage 3 clustering
+  - confidence (float 0-100)      — blended retrieval + LLM score from chat.py
+  - sources (list[dict])          — top RRF chunks that informed the answer
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
@@ -19,29 +20,46 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-router = APIRouter()
+from database.db import get_db
 
-# ── In-memory store (replaced by a real DB in production) ────────────────────
-# Dict[ticket_id -> Ticket]
-_TICKETS: dict[str, "Ticket"] = {}
+router = APIRouter()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class Ticket(BaseModel):
-    ticket_id:   str
-    query:       str
-    confidence:  float          # 0-100 scale (matches LLM output); stored as float to avoid truncation
-    status:      Literal["open", "resolved"] = "open"
-    sources:     list[dict] = []
-    resolution:  str | None = None
-    kb_draft_id: str | None = None          # set by Stage 5 after approval
-    created_at:  str = ""
-    resolved_at: str | None = None
+    ticket_id:       str
+    query:           str
+    confidence:      float
+    status:          Literal["open", "resolved"] = "open"
+    sources:         list[dict] = []
+    query_embedding: list[float] | None = None   # for Stage 3 clustering
+    resolution:      str | None = None
+    kb_draft_id:     str | None = None
+    created_at:      str = ""
+    resolved_at:     str | None = None
 
 
 class ResolveBody(BaseModel):
     resolution: str
+
+
+# ── Row → Ticket ──────────────────────────────────────────────────────────────
+
+def _row_to_ticket(row, include_embedding: bool = True) -> Ticket:
+    embedding_raw = row["query_embedding"] if include_embedding else None
+    return Ticket(
+        ticket_id       = row["ticket_id"],
+        query           = row["query"],
+        confidence      = row["confidence"],
+        status          = row["status"],
+        sources         = json.loads(row["sources"]),
+        query_embedding = json.loads(embedding_raw) if embedding_raw else None,
+        resolution      = row["resolution"],
+        kb_draft_id     = row["kb_draft_id"],
+        created_at      = row["created_at"],
+        resolved_at     = row["resolved_at"],
+    )
 
 
 # ── Internal helper (called by chat.py confidence router) ─────────────────────
@@ -50,86 +68,121 @@ def create_ticket_internal(
     query: str,
     confidence: float,
     sources: list[dict],
+    query_embedding: list[float] | None = None,
 ) -> Ticket:
     """
-    Create and store a ticket from a low-confidence escalation.
-    Called directly by the chat router — not an HTTP endpoint.
+    Persist a ticket from a low-confidence escalation.
+    query_embedding is captured in chat.py at retrieval time (free — model already loaded).
     """
-    ticket = Ticket(
-        ticket_id=f"TK-{uuid.uuid4().hex[:8].upper()}",
-        query=query,
-        confidence=confidence,
-        sources=sources,
-        created_at=datetime.now(timezone.utc).isoformat(),
+    ticket_id  = f"TK-{uuid.uuid4().hex[:8].upper()}"
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO tickets
+                (ticket_id, query, confidence, status, sources, query_embedding, created_at)
+            VALUES (?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (
+                ticket_id,
+                query,
+                confidence,
+                json.dumps(sources),
+                json.dumps(query_embedding) if query_embedding is not None else None,
+                created_at,
+            ),
+        )
+
+    return Ticket(
+        ticket_id       = ticket_id,
+        query           = query,
+        confidence      = confidence,
+        sources         = sources,
+        query_embedding = query_embedding,
+        created_at      = created_at,
     )
-    _TICKETS[ticket.ticket_id] = ticket
-    return ticket
 
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
 
-@router.get("/", response_model=list[Ticket])
+@router.get("/", response_model=list[Ticket], response_model_exclude={"query_embedding"})
 async def list_tickets():
-    """Return all tickets (open + resolved), newest first."""
-    return sorted(
-        _TICKETS.values(),
-        key=lambda t: t.created_at,
-        reverse=True,
-    )
+    """
+    Return all tickets (open + resolved), newest first.
+    Embeddings (384 floats each) are excluded — the dashboard never shows them;
+    Stage 3 clustering reads them straight from the DB instead.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tickets ORDER BY created_at DESC"
+        ).fetchall()
+    return [_row_to_ticket(r, include_embedding=False) for r in rows]
 
 
 @router.get("/{ticket_id}", response_model=Ticket)
 async def get_ticket(ticket_id: str):
     """Return a single ticket by ID."""
-    ticket = _TICKETS.get(ticket_id)
-    if not ticket:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
+    if not row:
         raise HTTPException(status_code=404, detail=f"Ticket {ticket_id} not found.")
-    return ticket
+    return _row_to_ticket(row)
 
 
 @router.post("/", response_model=Ticket)
 async def create_ticket(body: dict):
-    """
-    Manually create a ticket (e.g. from admin dashboard).
-    For automatic escalation, the chat router calls create_ticket_internal().
-    """
+    """Manually create a ticket (e.g. from admin dashboard)."""
     query = str(body.get("query", "")).strip()
     if not query:
         raise HTTPException(status_code=400, detail="query is required.")
-    confidence = int(body.get("confidence", 0))
-    sources = body.get("sources", [])
-    ticket = create_ticket_internal(query, confidence, sources)
-    return ticket
+    confidence = float(body.get("confidence", 0))
+    sources    = body.get("sources", [])
+    return create_ticket_internal(query, confidence, sources)
 
 
 @router.patch("/{ticket_id}/resolve", response_model=Ticket)
 async def resolve_ticket(ticket_id: str, body: ResolveBody):
     """
     Stage 4: Mark ticket as resolved.
-    Stores the resolution text as a pending KB draft (Stage 5).
+    Auto-creates a KB draft for the self-learning loop (Stage 5).
     """
-    ticket = _TICKETS.get(ticket_id)
-    if not ticket:
-        raise HTTPException(status_code=404, detail=f"Ticket {ticket_id} not found.")
-    if ticket.status == "resolved":
-        raise HTTPException(status_code=409, detail="Ticket is already resolved.")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Ticket {ticket_id} not found.")
+        if row["status"] == "resolved":
+            raise HTTPException(status_code=409, detail="Ticket is already resolved.")
 
-    resolution = body.resolution.strip()
-    if not resolution:
-        raise HTTPException(status_code=400, detail="resolution text cannot be empty.")
+        resolution  = body.resolution.strip()
+        if not resolution:
+            raise HTTPException(status_code=400, detail="resolution text cannot be empty.")
 
-    ticket.status      = "resolved"
-    ticket.resolution  = resolution
-    ticket.resolved_at = datetime.now(timezone.utc).isoformat()
+        resolved_at = datetime.now(timezone.utc).isoformat()
 
-    # Stage 5 hook: create a KB draft from this resolution
-    from routers.kb import create_draft_internal
-    draft = create_draft_internal(
-        title=f"Resolution: {ticket.query[:60]}",
-        content=f"Q: {ticket.query}\n\nA: {resolution}",
-        source_ticket_id=ticket.ticket_id,
-    )
-    ticket.kb_draft_id = draft.draft_id
-    _TICKETS[ticket_id] = ticket
+        # Stage 5: create KB draft
+        from routers.kb import create_draft_internal
+        ticket = _row_to_ticket(row)
+        draft = create_draft_internal(
+            title            = f"Resolution: {ticket.query[:60]}",
+            content          = f"Q: {ticket.query}\n\nA: {resolution}",
+            source_ticket_id = ticket_id,
+        )
 
-    return ticket
+        conn.execute(
+            """
+            UPDATE tickets
+               SET status = 'resolved',
+                   resolution = ?,
+                   kb_draft_id = ?,
+                   resolved_at = ?
+             WHERE ticket_id = ?
+            """,
+            (resolution, draft.draft_id, resolved_at, ticket_id),
+        )
+
+    return await get_ticket(ticket_id)
