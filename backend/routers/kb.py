@@ -127,7 +127,9 @@ def create_draft_internal(
     if query and resolution:
         polished = _polish_article(query, resolution)
         if polished:
-            title, content = polished
+            p_title, p_content = polished
+            title = p_title
+            content = f"Original Query: {query}\n\n{p_content}"
     draft_id   = f"KB-{uuid.uuid4().hex[:8].upper()}"
     created_at = datetime.now(timezone.utc).isoformat()
 
@@ -200,7 +202,11 @@ def _upsert_into_kb(draft_id: str, title: str, content: str) -> None:
     metadata = {"source": f"self-learned/{draft_id}", "category": "self-learned"}
 
     # 1. Dense: embed + persist into ChromaDB
-    _get_vectorstore().add_documents([Document(page_content=article_text, metadata=metadata)])
+    vs = _get_vectorstore()
+    vs.add_documents([Document(page_content=article_text, metadata=metadata)])
+    # In older versions of Langchain/Chroma, explicit persist() is required to write to SQLite.
+    if hasattr(vs, "persist"):
+        vs.persist()
 
     # 2. Sparse: append to meta, rebuild BM25, atomically swap the cached index
     with open(_BM25_META, "r", encoding="utf-8") as f:

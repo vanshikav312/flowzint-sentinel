@@ -108,7 +108,7 @@ python data/ingest_docs.py
 
 ### 5. Start the backend server
 ```bash
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --reload-exclude "database/*" --port 8000
 ```
 
 ### 6. Start the frontend (separate terminal)
