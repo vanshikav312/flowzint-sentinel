@@ -12,7 +12,7 @@ One continuous story, every stage of the pipeline on screen:
 
 1. **Known question** — customer asks "my payment failed but money was deducted" → instant, grounded answer with cited sources.
 2. **Unknown question** — a query the docs don't cover → the bot refuses to bluff, escalates, and a ticket appears on the admin dashboard.
-3. **Two more similar complaints** (different wording) → 🚨 the system connects the dots: an **incident** is raised automatically with severity and all linked tickets.
+3. **Two more similar complaints** (different wording) → the system connects the dots: an **incident** is raised automatically with severity and all linked tickets.
 4. **A fourth similar complaint** → no new ticket. The customer is told *"this issue is already known — our team is on it (ref: INC-…)"* and the report is counted under the incident.
 5. **Human resolution** — an agent resolves the ticket in one sentence; the LLM rewrites it into a clean documentation article.
 6. **Approve** — one click; the article is chunked, embedded, and added to both retrieval indexes live (no restart).
