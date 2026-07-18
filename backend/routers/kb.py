@@ -180,46 +180,74 @@ def _upsert_into_kb(draft_id: str, title: str, content: str) -> None:
     Stage 5 core: make an approved article retrievable by BOTH halves of
     hybrid RAG.
 
-    1. Dense side  — embed the article and add it to the ChromaDB collection
-       (via the cached vectorstore singleton, so it persists to disk and is
-       immediately searchable without a restart).
-    2. Sparse side — append the article to bm25_meta.json and rebuild the
-       BM25 index over all texts. BM25Okapi is a static structure that cannot
-       be appended to; a full rebuild is <1s at this corpus size. The lru_cache
-       on _get_bm25 is cleared so the next chat request loads the new index.
+    1. Dense side  — split the article with the same chunker the ingest
+       pipeline used (RecursiveCharacterTextSplitter, chunk_size=800,
+       chunk_overlap=150), then embed each chunk and add to ChromaDB.
+       Chunking is critical: storing the full article as a single document
+       produces a mean-pooled embedding that is too diffuse to rank in
+       dense top-k against the 30k+ fine-grained chunks already in the
+       collection.  Matching the ingestion chunk size ensures self-learned
+       articles compete on equal footing with existing corpus documents.
 
-    Raises on failure — the caller keeps the draft 'pending' so approval can
-    simply be retried.
+    2. Sparse side — append one entry per chunk to bm25_meta.json and
+       rebuild the BM25Okapi index.  The lru_cache on _get_bm25 is cleared
+       so the next chat request loads the refreshed index immediately
+       without a server restart.
+
+    Raises on failure — the caller keeps the draft 'pending' so approval
+    can simply be retried.
     """
     import pickle
 
     from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     from rank_bm25 import BM25Okapi
 
     from routers.chat import _get_bm25, _get_vectorstore, _BM25_META, _BM25_PKL
 
     article_text = f"{title}\n\n{content}"
-    metadata = {"source": f"self-learned/{draft_id}", "category": "self-learned"}
+    source       = f"self-learned/{draft_id}"
+    metadata     = {"source": source, "category": "self-learned"}
 
-    # 1. Dense: embed + persist into ChromaDB
+    # Split into chunks matching the ingestion pipeline (chunk_size=800, overlap=150)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_text(article_text)
+    if not chunks:
+        chunks = [article_text]
+
+    documents = [
+        Document(page_content=chunk, metadata=metadata)
+        for chunk in chunks
+    ]
+
+    log.info(f"Stage 5 upsert: {len(documents)} chunk(s) for draft {draft_id}")
+
+    # 1. Dense: embed chunks + add to the cached vectorstore singleton
     vs = _get_vectorstore()
-    vs.add_documents([Document(page_content=article_text, metadata=metadata)])
-    # In older versions of Langchain/Chroma, explicit persist() is required to write to SQLite.
+    vs.add_documents(documents)
+    # persist() is a no-op on chromadb >= 0.4 (auto-persisted) but harmless
     if hasattr(vs, "persist"):
         vs.persist()
 
-    # 2. Sparse: append to meta, rebuild BM25, atomically swap the cached index
+    # 2. Sparse: one BM25 entry per chunk, rebuild index, clear lru_cache
     with open(_BM25_META, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    meta.append(
-        {
-            "index":    len(meta),
-            "source":   metadata["source"],
-            "category": metadata["category"],
-            "snippet":  article_text[:120].replace("\n", " "),
-            "text":     article_text,
-        }
-    )
+
+    for chunk in chunks:
+        meta.append(
+            {
+                "index":    len(meta),
+                "source":   source,
+                "category": "self-learned",
+                "snippet":  chunk[:120].replace("\n", " "),
+                "text":     chunk,
+            }
+        )
+
     tokenized = [entry["text"].lower().split() for entry in meta]
     bm25 = BM25Okapi(tokenized)
 

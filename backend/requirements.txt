@@ -13,7 +13,7 @@ chromadb
 rank-bm25
 
 # LLM answer generation + KB article drafting (free tier)
-groq
+groq==1.5.0
 
 # API server
 fastapi
