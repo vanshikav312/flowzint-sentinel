@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, KeyboardEvent } from "react";
+import { Bot, AlertTriangle, Wrench, Send, Loader2 } from "lucide-react";
 
 const API_BASE = "http://localhost:8000";
 
@@ -14,14 +15,16 @@ interface Message {
 }
 
 function ConfidenceBadge({ score }: { score: number }) {
-  const color =
+  const style =
     score >= 40
-      ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+      ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
       : score >= 20
-      ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
-      : "bg-red-500/20 text-red-300 border-red-500/40";
+      ? "bg-amber-500/15 text-amber-400 border border-amber-500/30"
+      : "bg-red-500/15 text-red-400 border border-red-500/30";
   return (
-    <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${color}`}>
+    <span
+      className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded ${style}`}
+    >
       {score.toFixed(0)}% confidence
     </span>
   );
@@ -31,7 +34,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: "bot",
-      text: "Hi! I'm FlowZint Sentinel. Ask me anything — I'll search the knowledge base and route your question to the right answer.",
+      text: "Hi, I'm FlowZint Sentinel. Ask me anything — I'll search the knowledge base and route your question to the right answer.",
     },
   ]);
   const [inputValue, setInputValue] = useState("");
@@ -57,28 +60,27 @@ export default function ChatPage() {
         body: JSON.stringify({ query }),
       });
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const data = await res.json();
 
-      const botMsg: Message = {
-        role: "bot",
-        text: data.answer ?? "Sorry, I couldn't get a response.",
-        confidence: data.confidence,
-        escalated: data.escalate,
-        ticket_id: data.ticket_id,
-        incident_id: data.incident_id,
-      };
-
-      setMessages((prev) => [...prev, botMsg]);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "bot",
+          text: data.answer ?? "Sorry, I couldn't get a response.",
+          confidence: data.confidence,
+          escalated: data.escalate,
+          ticket_id: data.ticket_id,
+          incident_id: data.incident_id,
+        },
+      ]);
     } catch {
       setMessages((prev) => [
         ...prev,
         {
           role: "bot",
-          text: "⚠️ Couldn't reach the backend. Make sure the server is running on port 8000.",
+          text: "Could not reach the backend. Make sure the server is running on port 8000.",
         },
       ]);
     } finally {
@@ -94,99 +96,84 @@ export default function ChatPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex flex-col items-center justify-center px-4 text-white">
-      <div className="w-full max-w-2xl flex flex-col h-[85vh] rounded-2xl border border-indigo-500/30 bg-slate-800/50 backdrop-blur overflow-hidden shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-slate-700/50 bg-slate-800/80">
-          <div className="w-9 h-9 rounded-full bg-indigo-600 flex items-center justify-center text-lg">
-            🤖
+    <main className="bg-[#0F172A] min-h-screen flex flex-col items-center pt-4 pb-6 px-4">
+      {/* Chat panel */}
+      <div
+        className="w-full max-w-2xl flex flex-col bg-[#1E293B] border border-[#334155] rounded-md overflow-hidden"
+        style={{ height: "calc(100vh - 80px)" }}
+      >
+        {/* Chat header */}
+        <div className="h-10 px-4 flex items-center gap-2 border-b border-[#334155] bg-[#0F172A] shrink-0">
+          <div className="w-6 h-6 bg-indigo-600 rounded flex items-center justify-center shrink-0">
+            <Bot className="w-3.5 h-3.5 text-white" />
           </div>
-          <div>
-            <p className="font-semibold text-white text-sm">FlowZint Sentinel</p>
-            <p className="text-xs text-emerald-400 flex items-center gap-1">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" />
-              Online · Hybrid RAG active
-            </p>
-          </div>
+          <span className="text-[13px] font-medium text-slate-100">FlowZint Sentinel</span>
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 ml-1 shrink-0" />
+          <span className="text-[11px] text-slate-400">Online · Hybrid RAG active</span>
         </div>
 
         {/* Message area */}
-        <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-4">
+        <div className="flex-1 overflow-y-auto px-4 py-3 flex flex-col gap-3">
           {messages.map((msg, i) => (
             <div
               key={i}
-              className={`flex items-start gap-3 ${
-                msg.role === "user" ? "flex-row-reverse self-end max-w-[80%]" : "max-w-[85%]"
-              }`}
+              className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
             >
-              {/* Avatar */}
-              <div
-                className={`w-7 h-7 rounded-full flex items-center justify-center text-sm shrink-0 ${
-                  msg.role === "user" ? "bg-violet-600" : "bg-indigo-600"
-                }`}
-              >
-                {msg.role === "user" ? "👤" : "🤖"}
-              </div>
+              {msg.role === "user" ? (
+                <div className="self-end max-w-[78%] bg-indigo-600 text-slate-100 text-[13px] px-3 py-2 rounded-md">
+                  <p className="whitespace-pre-wrap leading-relaxed">{msg.text}</p>
+                </div>
+              ) : (
+                <div className="max-w-[85%] bg-[#0F172A] border border-[#334155] text-slate-200 text-[13px] px-3 py-2 rounded-md">
+                  <p className="whitespace-pre-wrap leading-relaxed">{msg.text}</p>
 
-              {/* Bubble */}
-              <div
-                className={`rounded-2xl px-4 py-3 text-sm ${
-                  msg.role === "user"
-                    ? "bg-violet-600/30 rounded-tr-sm text-violet-100"
-                    : "bg-slate-700/70 rounded-tl-sm text-slate-200"
-                }`}
-              >
-                <p className="whitespace-pre-wrap leading-relaxed">{msg.text}</p>
+                  {/* Confidence badge */}
+                  {msg.confidence !== undefined && (
+                    <div className="mt-2">
+                      <ConfidenceBadge score={msg.confidence} />
+                    </div>
+                  )}
 
-                {/* Confidence badge */}
-                {msg.confidence !== undefined && (
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <ConfidenceBadge score={msg.confidence} />
-                  </div>
-                )}
+                  {/* Escalation notice — new ticket opened */}
+                  {msg.escalated && msg.ticket_id && (
+                    <div className="bg-amber-500/10 border-l-2 border-amber-500 px-3 py-2 rounded-sm mt-2 flex items-start gap-2">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <p className="text-[11px] text-amber-300">
+                        Escalated to human agent · Ticket ID:{" "}
+                        <span className="font-mono font-semibold">{msg.ticket_id}</span>
+                        {msg.incident_id && (
+                          <>
+                            {" "}· linked to investigation{" "}
+                            <span className="font-mono font-semibold">{msg.incident_id}</span>
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  )}
 
-                {/* Escalation notice — new ticket opened */}
-                {msg.escalated && msg.ticket_id && (
-                  <div className="mt-2 flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2">
-                    <span className="text-amber-400 text-xs">⚠️</span>
-                    <p className="text-xs text-amber-300">
-                      Escalated to human agent · Ticket ID:{" "}
-                      <span className="font-mono font-semibold">{msg.ticket_id}</span>
-                      {msg.incident_id && (
-                        <>
-                          {" "}· linked to investigation{" "}
-                          <span className="font-mono font-semibold">{msg.incident_id}</span>
-                        </>
-                      )}
-                    </p>
-                  </div>
-                )}
-
-                {/* Known-issue notice — report absorbed by an existing incident */}
-                {msg.escalated && !msg.ticket_id && msg.incident_id && (
-                  <div className="mt-2 flex items-center gap-2 bg-sky-500/10 border border-sky-500/30 rounded-lg px-3 py-2">
-                    <span className="text-sky-400 text-xs">🛠️</span>
-                    <p className="text-xs text-sky-300">
-                      Known issue — our team is already on it · Ref:{" "}
-                      <span className="font-mono font-semibold">{msg.incident_id}</span>
-                    </p>
-                  </div>
-                )}
-              </div>
+                  {/* Known-issue notice — report absorbed by existing incident */}
+                  {msg.escalated && !msg.ticket_id && msg.incident_id && (
+                    <div className="bg-sky-500/10 border-l-2 border-sky-500 px-3 py-2 rounded-sm mt-2 flex items-start gap-2">
+                      <Wrench className="w-3.5 h-3.5 text-sky-400 shrink-0 mt-0.5" />
+                      <p className="text-[11px] text-sky-300">
+                        Known issue — our team is already on it · Ref:{" "}
+                        <span className="font-mono font-semibold">{msg.incident_id}</span>
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ))}
 
           {/* Loading indicator */}
           {isLoading && (
-            <div className="flex items-start gap-3 max-w-[85%]">
-              <div className="w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-sm shrink-0">
-                🤖
-              </div>
-              <div className="bg-slate-700/70 rounded-2xl rounded-tl-sm px-4 py-3">
+            <div className="flex items-start">
+              <div className="bg-[#0F172A] border border-[#334155] px-3 py-2 rounded-md">
                 <div className="flex gap-1.5 items-center h-4">
-                  <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce [animation-delay:-0.3s]" />
-                  <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce [animation-delay:-0.15s]" />
-                  <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-bounce [animation-delay:-0.3s]" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-bounce [animation-delay:-0.15s]" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-bounce" />
                 </div>
               </div>
             </div>
@@ -196,7 +183,7 @@ export default function ChatPage() {
         </div>
 
         {/* Input bar */}
-        <div className="px-4 py-3 border-t border-slate-700/50 bg-slate-800/80 flex gap-3">
+        <div className="h-12 px-3 py-2 border-t border-[#334155] bg-[#0F172A] flex gap-2 items-center shrink-0">
           <input
             type="text"
             value={inputValue}
@@ -204,23 +191,25 @@ export default function ChatPage() {
             onKeyDown={handleKeyDown}
             placeholder="Type your question…"
             disabled={isLoading}
-            className="flex-1 bg-slate-700/60 border border-slate-600/50 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/60 disabled:opacity-50"
+            className="flex-1 bg-[#0F172A] border border-[#334155] rounded text-[13px] text-slate-100 px-3 py-1.5 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600 disabled:opacity-50"
           />
           <button
             onClick={sendMessage}
             disabled={isLoading || !inputValue.trim()}
-            className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 transition text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[12px] font-medium flex items-center gap-1.5 disabled:opacity-40"
+            aria-label="Send message"
           >
             {isLoading ? (
-              <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
-              "Send"
+              <Send className="w-3.5 h-3.5" />
             )}
+            Send
           </button>
         </div>
       </div>
 
-      <p className="mt-4 text-xs text-slate-500">
+      <p className="mt-3 text-[11px] text-slate-600 font-mono">
         Powered by local embeddings · sentence-transformers · ChromaDB · Groq
       </p>
     </main>

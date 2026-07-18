@@ -1,0 +1,7 @@
+# This directory is intentionally empty and gitignored.
+#
+# ChromaDB vector store files are generated locally by running:
+#   python data/ingest.py
+#
+# Never commit this directory — it is listed in .gitignore.
+# Each developer generates their own local vector index from raw data files.

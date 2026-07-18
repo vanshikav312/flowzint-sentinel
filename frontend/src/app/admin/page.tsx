@@ -1,12 +1,25 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import {
+  Ticket,
+  AlertTriangle,
+  BookOpen,
+  BarChart2,
+  RefreshCw,
+  CheckCircle,
+  XCircle,
+  Loader2,
+  AlertCircle,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 
 const API_BASE = "http://localhost:8000";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-interface Ticket {
+interface TicketItem {
   ticket_id: string;
   query: string;
   confidence: number;
@@ -43,7 +56,7 @@ interface Stats {
   avg_confidence: number;
 }
 
-// ── Utility helpers ────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function timeAgo(iso: string): string {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -53,40 +66,43 @@ function timeAgo(iso: string): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-const severityColor: Record<string, string> = {
-  low: "bg-slate-500/20 text-slate-300 border-slate-500/30",
-  medium: "bg-amber-500/20 text-amber-300 border-amber-500/30",
-  high: "bg-red-500/20 text-red-300 border-red-500/30",
-  critical: "bg-red-700/30 text-red-200 border-red-600/50",
+const severityStyle: Record<string, string> = {
+  low:      "bg-slate-500/15 text-slate-400 border-slate-500/30",
+  medium:   "bg-amber-500/15 text-amber-400 border-amber-500/30",
+  high:     "bg-red-500/15 text-red-400 border-red-500/30",
+  critical: "bg-red-700/20 text-red-300 border-red-600/40",
 };
 
-const incidentStatusColor: Record<string, string> = {
-  open: "bg-indigo-500/20 text-indigo-300",
-  acknowledged: "bg-amber-500/20 text-amber-300",
-  resolved: "bg-emerald-500/20 text-emerald-300",
+const severityBarColor: Record<string, string> = {
+  low:      "bg-slate-500",
+  medium:   "bg-amber-500",
+  high:     "bg-red-500",
+  critical: "bg-red-600",
 };
+
+const incidentStatusStyle: Record<string, string> = {
+  open:         "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
+  acknowledged: "bg-amber-500/15 text-amber-400 border-amber-500/30",
+  resolved:     "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+};
+
+function confidenceColor(score: number): string {
+  if (score >= 40) return "text-emerald-400";
+  if (score >= 20) return "text-amber-400";
+  return "text-red-400";
+}
 
 function Spinner({ small }: { small?: boolean }) {
   return (
-    <span
-      className={`inline-block rounded-full border-2 border-white/30 border-t-white animate-spin ${
-        small ? "w-3 h-3" : "w-4 h-4"
-      }`}
+    <Loader2
+      className={`animate-spin shrink-0 ${small ? "w-3 h-3" : "w-4 h-4"}`}
     />
   );
 }
 
-// ── Skeleton loader ────────────────────────────────────────────────────────────
-
 function SkeletonRow() {
   return (
-    <div className="flex items-center justify-between bg-slate-700/40 rounded-xl px-4 py-3 animate-pulse">
-      <div className="flex flex-col gap-1.5 flex-1">
-        <div className="h-3 bg-slate-600/60 rounded w-2/3" />
-        <div className="h-2.5 bg-slate-600/40 rounded w-1/3" />
-      </div>
-      <div className="h-5 w-16 bg-slate-600/40 rounded-full ml-4" />
-    </div>
+    <div className="h-9 bg-[#1E293B] rounded border border-[#334155] animate-pulse" />
   );
 }
 
@@ -100,11 +116,11 @@ function SectionSkeleton() {
   );
 }
 
-// ── Resolve panel (inline slide-down) ─────────────────────────────────────────
+// ── Resolve panel ──────────────────────────────────────────────────────────────
 
 interface ResolvePanelProps {
-  ticket: Ticket;
-  onSuccess: (updated: Ticket) => void;
+  ticket: TicketItem;
+  onSuccess: (updated: TicketItem) => void;
   onCancel: () => void;
 }
 
@@ -115,10 +131,7 @@ function ResolvePanel({ ticket, onSuccess, onCancel }: ResolvePanelProps) {
 
   async function submit() {
     const resolution = text.trim();
-    if (!resolution) {
-      setError("Resolution text cannot be empty.");
-      return;
-    }
+    if (!resolution) { setError("Resolution text cannot be empty."); return; }
     setSubmitting(true);
     setError(null);
     try {
@@ -131,8 +144,7 @@ function ResolvePanel({ ticket, onSuccess, onCancel }: ResolvePanelProps) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail ?? `HTTP ${res.status}`);
       }
-      const updated: Ticket = await res.json();
-      onSuccess(updated);
+      onSuccess(await res.json());
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
@@ -141,30 +153,36 @@ function ResolvePanel({ ticket, onSuccess, onCancel }: ResolvePanelProps) {
   }
 
   return (
-    <div className="mt-3 bg-slate-800/80 border border-indigo-500/30 rounded-xl p-4 flex flex-col gap-3">
-      <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">
-        Resolving: <span className="text-slate-200 normal-case font-normal">{ticket.query}</span>
+    <div className="border-t border-[#334155] bg-[#0F172A] px-4 py-3 flex flex-col gap-2">
+      <p className="text-[11px] text-slate-500 uppercase tracking-wide">
+        Resolving:{" "}
+        <span className="text-slate-300 normal-case font-normal">{ticket.query}</span>
       </p>
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
         placeholder="Type your resolution here…"
         rows={3}
-        className="bg-slate-700/60 border border-slate-600/50 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/60 resize-none"
+        className="w-full bg-[#1E293B] border border-[#334155] rounded text-[13px] text-slate-200 px-3 py-2 resize-none focus:outline-none focus:border-indigo-500 placeholder:text-slate-600"
       />
-      {error && <p className="text-xs text-red-400">{error}</p>}
+      {error && (
+        <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+          <AlertCircle className="w-3 h-3 shrink-0" />
+          {error}
+        </p>
+      )}
       <div className="flex gap-2 justify-end">
         <button
           onClick={onCancel}
           disabled={submitting}
-          className="text-xs px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-700 transition disabled:opacity-50"
+          className="border border-[#334155] text-slate-400 text-[12px] px-3 py-1.5 rounded hover:bg-slate-700 transition-colors disabled:opacity-50"
         >
           Cancel
         </button>
         <button
           onClick={submit}
           disabled={submitting || !text.trim()}
-          className="text-xs px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+          className="bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] px-3 py-1.5 rounded font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
         >
           {submitting && <Spinner small />}
           Submit
@@ -174,27 +192,45 @@ function ResolvePanel({ ticket, onSuccess, onCancel }: ResolvePanelProps) {
   );
 }
 
+// ── Stat card ──────────────────────────────────────────────────────────────────
+
+function StatCard({
+  label,
+  value,
+  icon,
+  accent,
+}: {
+  label: string;
+  value: string;
+  icon: React.ReactNode;
+  accent?: string;
+}) {
+  return (
+    <div className="bg-[#1E293B] border border-[#334155] rounded-md px-4 py-3 flex items-center gap-3">
+      <div className={`w-8 h-8 rounded border border-[#334155] flex items-center justify-center shrink-0 ${accent || "bg-[#0F172A]"}`}>
+        {icon}
+      </div>
+      <div>
+        <div className="text-xl font-bold font-mono text-slate-100">{value}</div>
+        <div className="text-[11px] text-slate-500 uppercase tracking-wide mt-0.5">{label}</div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function AdminPage() {
-  const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [tickets, setTickets] = useState<TicketItem[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [drafts, setDrafts] = useState<KBDraft[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
-
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  // ticket_id currently showing inline resolve panel
   const [resolvingId, setResolvingId] = useState<string | null>(null);
-
-  // per-item in-flight state: maps id → true while a fetch is running
   const [inFlight, setInFlight] = useState<Record<string, boolean>>({});
-
-  // per-draft display overrides (approved / rejected)
   const [draftStatus, setDraftStatus] = useState<Record<string, KBDraft["status"]>>({});
-
-  // ── Fetch all data ──────────────────────────────────────────────────────────
+  const [expandedDraft, setExpandedDraft] = useState<string | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -204,22 +240,12 @@ export default function AdminPage() {
         fetch(`${API_BASE}/api/kb/drafts`),
         fetch(`${API_BASE}/api/tickets/stats`),
       ]);
-
-      if (!tRes.ok || !iRes.ok || !kRes.ok || !sRes.ok) {
+      if (!tRes.ok || !iRes.ok || !kRes.ok || !sRes.ok)
         throw new Error("One or more backend endpoints returned an error.");
-      }
-
       const [t, i, k, s] = await Promise.all([
-        tRes.json(),
-        iRes.json(),
-        kRes.json(),
-        sRes.json(),
+        tRes.json(), iRes.json(), kRes.json(), sRes.json(),
       ]);
-
-      setTickets(t);
-      setIncidents(i);
-      setDrafts(k);
-      setStats(s);
+      setTickets(t); setIncidents(i); setDrafts(k); setStats(s);
       setError(null);
     } catch (e: unknown) {
       setError(
@@ -232,43 +258,24 @@ export default function AdminPage() {
     }
   }, []);
 
-  // Initial load + 15-second auto-refresh
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 15_000);
-    return () => clearInterval(interval);
+    const id = setInterval(fetchAll, 15_000);
+    return () => clearInterval(id);
   }, [fetchAll]);
 
-  // ── Resolve ticket ──────────────────────────────────────────────────────────
-
-  function handleResolveSuccess(updated: Ticket) {
-    setTickets((prev) =>
-      prev.map((t) => (t.ticket_id === updated.ticket_id ? updated : t))
-    );
+  function handleResolveSuccess(updated: TicketItem) {
+    setTickets((prev) => prev.map((t) => (t.ticket_id === updated.ticket_id ? updated : t)));
     setResolvingId(null);
-    // Refresh drafts so the new KB draft shows up immediately
-    fetch(`${API_BASE}/api/kb/drafts`)
-      .then((r) => r.json())
-      .then(setDrafts)
-      .catch(() => {});
-    fetch(`${API_BASE}/api/tickets/stats`)
-      .then((r) => r.json())
-      .then(setStats)
-      .catch(() => {});
+    fetch(`${API_BASE}/api/kb/drafts`).then((r) => r.json()).then(setDrafts).catch(() => {});
+    fetch(`${API_BASE}/api/tickets/stats`).then((r) => r.json()).then(setStats).catch(() => {});
   }
-
-  // ── Approve draft ───────────────────────────────────────────────────────────
 
   async function approveDraft(draftId: string) {
     setInFlight((p) => ({ ...p, [draftId]: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/kb/drafts/${draftId}/approve`, {
-        method: "POST",
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `HTTP ${res.status}`);
-      }
+      const res = await fetch(`${API_BASE}/api/kb/drafts/${draftId}/approve`, { method: "POST" });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail ?? `HTTP ${res.status}`); }
       setDraftStatus((p) => ({ ...p, [draftId]: "approved" }));
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : "Failed to approve draft.");
@@ -277,18 +284,11 @@ export default function AdminPage() {
     }
   }
 
-  // ── Reject draft ────────────────────────────────────────────────────────────
-
   async function rejectDraft(draftId: string) {
     setInFlight((p) => ({ ...p, [draftId]: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/kb/drafts/${draftId}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `HTTP ${res.status}`);
-      }
+      const res = await fetch(`${API_BASE}/api/kb/drafts/${draftId}`, { method: "DELETE" });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail ?? `HTTP ${res.status}`); }
       setDraftStatus((p) => ({ ...p, [draftId]: "rejected" }));
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : "Failed to reject draft.");
@@ -297,23 +297,13 @@ export default function AdminPage() {
     }
   }
 
-  // ── Acknowledge incident ────────────────────────────────────────────────────
-
   async function acknowledgeIncident(incidentId: string) {
     setInFlight((p) => ({ ...p, [incidentId]: true }));
     try {
-      const res = await fetch(
-        `${API_BASE}/api/incidents/${incidentId}/acknowledge`,
-        { method: "PATCH" }
-      );
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `HTTP ${res.status}`);
-      }
+      const res = await fetch(`${API_BASE}/api/incidents/${incidentId}/acknowledge`, { method: "PATCH" });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail ?? `HTTP ${res.status}`); }
       const updated: Incident = await res.json();
-      setIncidents((prev) =>
-        prev.map((i) => (i.incident_id === incidentId ? updated : i))
-      );
+      setIncidents((prev) => prev.map((i) => (i.incident_id === incidentId ? updated : i)));
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : "Failed to acknowledge incident.");
     } finally {
@@ -321,17 +311,13 @@ export default function AdminPage() {
     }
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
-
-  const pendingDrafts = drafts.filter((d) => {
-    const s = draftStatus[d.draft_id] ?? d.status;
-    return s === "pending";
-  });
+  const pendingDrafts  = drafts.filter((d) => (draftStatus[d.draft_id] ?? d.status) === "pending");
   const activeIncidents = incidents.filter((i) => i.status === "open");
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white px-6 py-8">
       <div className="max-w-6xl mx-auto">
+
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
@@ -344,16 +330,20 @@ export default function AdminPage() {
           </div>
           <button
             onClick={() => { setLoading(true); fetchAll(); }}
-            className="text-xs px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-700 transition"
+            className="text-xs px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-700 transition flex items-center gap-1.5"
           >
-            ↻ Refresh
+            <RefreshCw className="w-3 h-3" />
+            Refresh
           </button>
         </div>
 
         {/* Error banner */}
         {error && (
           <div className="mb-6 flex items-center justify-between bg-red-900/30 border border-red-500/40 rounded-xl px-4 py-3">
-            <p className="text-sm text-red-300">⚠️ {error}</p>
+            <p className="text-sm text-red-300 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              {error}
+            </p>
             <button
               onClick={() => { setLoading(true); fetchAll(); }}
               className="text-xs px-3 py-1.5 rounded-lg bg-red-600/30 hover:bg-red-600/50 border border-red-500/30 text-red-300 transition"
@@ -365,50 +355,44 @@ export default function AdminPage() {
 
         {/* Stats row */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
-          {[
-            {
-              label: "Open Tickets",
-              value: stats ? String(stats.open) : "—",
-              icon: "🎫",
-            },
-            {
-              label: "Active Incidents",
-              value: loading ? "—" : String(activeIncidents.length),
-              icon: "🚨",
-            },
-            {
-              label: "KB Drafts Pending",
-              value: loading ? "—" : String(pendingDrafts.length),
-              icon: "📝",
-            },
-            {
-              label: "Avg Confidence",
-              value: stats ? `${stats.avg_confidence.toFixed(0)}%` : "—",
-              icon: "📊",
-            },
-          ].map((s) => (
-            <div
-              key={s.label}
-              className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-4"
-            >
-              <div className="text-2xl mb-1">{s.icon}</div>
-              <div className="text-2xl font-bold">{s.value}</div>
-              <div className="text-xs text-slate-400 mt-0.5">{s.label}</div>
-            </div>
-          ))}
+          <StatCard
+            label="Open Tickets"
+            value={stats ? String(stats.open) : "—"}
+            icon={<Ticket className="w-4 h-4 text-indigo-300" />}
+            accent="bg-indigo-500/20"
+          />
+          <StatCard
+            label="Active Incidents"
+            value={loading ? "—" : String(activeIncidents.length)}
+            icon={<AlertTriangle className="w-4 h-4 text-amber-300" />}
+            accent="bg-amber-500/20"
+          />
+          <StatCard
+            label="KB Drafts Pending"
+            value={loading ? "—" : String(pendingDrafts.length)}
+            icon={<BookOpen className="w-4 h-4 text-violet-300" />}
+            accent="bg-violet-500/20"
+          />
+          <StatCard
+            label="Avg Confidence"
+            value={stats ? `${stats.avg_confidence.toFixed(0)}%` : "—"}
+            icon={<BarChart2 className="w-4 h-4 text-emerald-300" />}
+            accent="bg-emerald-500/20"
+          />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* ── Tickets panel ──────────────────────────────────────────────── */}
-          <section className="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-5">
-            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">
-              🎫 Escalated Tickets
-            </h2>
 
+          {/* ── Tickets ── */}
+          <section className="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-5">
+            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <Ticket className="w-4 h-4 text-indigo-400" />
+              Escalated Tickets
+            </h2>
             {loading ? (
               <SectionSkeleton />
             ) : tickets.length === 0 ? (
-              <p className="text-xs text-slate-500 text-center py-4">No tickets yet.</p>
+              <p className="text-xs text-slate-500 text-center py-6">No tickets yet.</p>
             ) : (
               <div className="flex flex-col gap-3">
                 {tickets.map((t) => (
@@ -417,36 +401,31 @@ export default function AdminPage() {
                       <div className="flex-1 min-w-0 mr-3">
                         <p className="text-sm font-medium text-white truncate">{t.query}</p>
                         <p className="text-xs text-slate-400 mt-0.5">
-                          {t.ticket_id} · {t.confidence.toFixed(0)}% conf ·{" "}
-                          {timeAgo(t.created_at)}
+                          {t.ticket_id} · {t.confidence.toFixed(0)}% conf · {timeAgo(t.created_at)}
                         </p>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
                         {t.status === "open" ? (
                           <>
-                            <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300">
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center gap-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
                               Open
                             </span>
                             <button
-                              onClick={() =>
-                                setResolvingId(
-                                  resolvingId === t.ticket_id ? null : t.ticket_id
-                                )
-                              }
+                              onClick={() => setResolvingId(resolvingId === t.ticket_id ? null : t.ticket_id)}
                               className="text-xs px-3 py-1 rounded-lg bg-violet-600/30 hover:bg-violet-600/50 border border-violet-500/40 text-violet-300 transition"
                             >
                               Resolve
                             </button>
                           </>
                         ) : (
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300">
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                             Resolved
                           </span>
                         )}
                       </div>
                     </div>
-
-                    {/* Inline resolve panel */}
                     {resolvingId === t.ticket_id && (
                       <ResolvePanel
                         ticket={t}
@@ -460,16 +439,16 @@ export default function AdminPage() {
             )}
           </section>
 
-          {/* ── Incidents panel ────────────────────────────────────────────── */}
+          {/* ── Incidents ── */}
           <section className="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-5">
-            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">
-              🚨 Detected Incidents
+            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400" />
+              Detected Incidents
             </h2>
-
             {loading ? (
               <SectionSkeleton />
             ) : incidents.length === 0 ? (
-              <p className="text-xs text-slate-500 text-center py-4">No incidents detected.</p>
+              <p className="text-xs text-slate-500 text-center py-6">No incidents detected.</p>
             ) : (
               <div className="flex flex-col gap-3">
                 {incidents.map((inc) => (
@@ -480,32 +459,23 @@ export default function AdminPage() {
                     <div className="flex-1 min-w-0 mr-3">
                       <p className="text-sm font-medium text-white truncate">{inc.topic}</p>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        {inc.incident_id} · {inc.ticket_count} queries ·{" "}
-                        {timeAgo(inc.detected_at)}
+                        {inc.incident_id} · {inc.ticket_count} queries · {timeAgo(inc.detected_at)}
                       </p>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded-full border ${
-                          severityColor[inc.severity]
-                        }`}
-                      >
+                      <span className={`text-xs px-2 py-0.5 rounded-full border ${severityStyle[inc.severity]}`}>
                         {inc.severity}
                       </span>
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded-full ${
-                          incidentStatusColor[inc.status]
-                        }`}
-                      >
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${incidentStatusStyle[inc.status]}`}>
                         {inc.status}
                       </span>
                       {inc.status === "open" && (
                         <button
                           onClick={() => acknowledgeIncident(inc.incident_id)}
                           disabled={!!inFlight[inc.incident_id]}
-                          className="text-xs px-3 py-1 rounded-lg bg-amber-600/30 hover:bg-amber-600/50 border border-amber-500/40 text-amber-300 transition disabled:opacity-50 flex items-center gap-1"
+                          className="text-xs px-3 py-1 rounded-lg bg-amber-600/30 hover:bg-amber-600/50 border border-amber-500/40 text-amber-300 transition disabled:opacity-50 flex items-center gap-1.5"
                         >
-                          {inFlight[inc.incident_id] && <Spinner small />}
+                          {inFlight[inc.incident_id] ? <Spinner small /> : null}
                           Acknowledge
                         </button>
                       )}
@@ -516,16 +486,19 @@ export default function AdminPage() {
             )}
           </section>
 
-          {/* ── KB Drafts — full width ──────────────────────────────────────── */}
+          {/* ── KB Drafts ── */}
           <section className="lg:col-span-2 bg-slate-800/50 border border-slate-700/50 rounded-2xl p-5">
-            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">
-              📝 KB Drafts Awaiting Approval (Self-Learning Loop)
+            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <BookOpen className="w-4 h-4 text-violet-400" />
+              KB Drafts Awaiting Approval
+              <span className="text-slate-500 font-normal normal-case tracking-normal text-xs">
+                — Self-Learning Loop
+              </span>
             </h2>
-
             {loading ? (
               <SectionSkeleton />
             ) : drafts.length === 0 ? (
-              <p className="text-xs text-slate-500 text-center py-4">
+              <p className="text-xs text-slate-500 text-center py-6">
                 No KB drafts yet. Resolve a ticket to generate one.
               </p>
             ) : (
@@ -533,7 +506,6 @@ export default function AdminPage() {
                 {drafts.map((d) => {
                   const currentStatus = draftStatus[d.draft_id] ?? d.status;
                   const busy = !!inFlight[d.draft_id];
-
                   return (
                     <div
                       key={d.draft_id}
@@ -549,34 +521,36 @@ export default function AdminPage() {
                           {timeAgo(d.created_at)}
                         </p>
                       </div>
-
                       <div className="flex items-center gap-2 shrink-0">
                         {currentStatus === "pending" && (
                           <>
                             <button
                               onClick={() => approveDraft(d.draft_id)}
                               disabled={busy}
-                              className="text-xs px-3 py-1 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/40 text-emerald-300 transition disabled:opacity-50 flex items-center gap-1"
+                              className="text-xs px-3 py-1 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/40 text-emerald-300 transition disabled:opacity-50 flex items-center gap-1.5"
                             >
-                              {busy && <Spinner small />}
-                              ✅ Approve
+                              {busy ? <Spinner small /> : <CheckCircle className="w-3 h-3" />}
+                              Approve
                             </button>
                             <button
                               onClick={() => rejectDraft(d.draft_id)}
                               disabled={busy}
-                              className="text-xs px-3 py-1 rounded-lg bg-red-600/20 hover:bg-red-600/40 border border-red-500/30 text-red-300 transition disabled:opacity-50"
+                              className="text-xs px-3 py-1 rounded-lg bg-red-600/20 hover:bg-red-600/40 border border-red-500/30 text-red-300 transition disabled:opacity-50 flex items-center gap-1.5"
                             >
-                              ✕ Reject
+                              <XCircle className="w-3 h-3" />
+                              Reject
                             </button>
                           </>
                         )}
                         {currentStatus === "approved" && (
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300">
-                            Queued for KB ✓
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                            Queued for KB
                           </span>
                         )}
                         {currentStatus === "rejected" && (
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/20 text-red-300">
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/20 text-red-300 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
                             Rejected
                           </span>
                         )}
