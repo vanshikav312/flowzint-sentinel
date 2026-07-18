@@ -25,8 +25,6 @@ A self-healing AI support system that combines hybrid retrieval-augmented genera
 - [Logging](#logging)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
-- [Future Improvements](#future-improvements)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -609,31 +607,7 @@ If all queries return low confidence scores, the ChromaDB collection may be empt
 
 The upsert into ChromaDB or BM25 failed. Check the backend logs for the specific error. The draft status remains `pending`, so approval can be retried after resolving the underlying issue.
 
----
 
-## Future Improvements
-
-- **Authentication and authorisation** — Add JWT-based auth or an API key mechanism before any production deployment. The admin endpoints currently have no access control.
-- **Asynchronous LLM calls** — The chat and KB approval routes are synchronous by design (blocking model calls), run in Uvicorn's thread pool. Migrating to async Groq client calls would improve concurrency under load.
-- **Streaming responses** — Stream the LLM output token-by-token to the chat UI for a lower perceived latency.
-- **Configurable similarity thresholds** — Expose `SIMILARITY_THRESHOLD` and `ESCALATION_THRESHOLD` as environment variables rather than source-level constants.
-- **Incident resolution workflow** — Currently incidents can only be acknowledged, not resolved. A full resolution flow with root cause notes would close the operational loop.
-- **Persistent embeddings for ChromaDB at ingestion** — The ingestion pipeline re-embeds from scratch on every run. An incremental ingestion mode that tracks already-processed files would reduce re-ingestion time.
-- **Multi-worker support** — Replacing SQLite with PostgreSQL and the in-process ChromaDB singleton with a ChromaDB server would enable horizontal scaling.
-- **Monitoring and alerting** — Integrate structured logging (e.g. JSON log format), metrics export (e.g. Prometheus), and alerting on incident creation events.
-- **Conversation context** — The current chat interface is stateless; each message is a fresh RAG call with no memory of prior turns. Adding session-based context would improve multi-turn support quality.
-
----
-
-## Contributing
-
-1. Fork the repository and create a feature branch from `main`.
-2. Follow the existing code style: type annotations on all function signatures, docstrings on all public functions, named loggers per module.
-3. Run the existing test suites before submitting a pull request.
-4. Do not commit secrets, database files, virtual environments, or generated indices. These are all covered by `.gitignore`.
-5. Submit a pull request with a clear description of the change and the problem it solves.
-
----
 
 ## License
 
